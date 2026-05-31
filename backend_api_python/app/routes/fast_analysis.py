@@ -26,7 +26,7 @@ _analysis_inflight = {}  # key -> expire_ts
 # Key: "market:symbol:timeframe:language" -> {"result": ..., "timestamp": ...}
 _analysis_result_cache = {}
 _analysis_cache_lock = threading.Lock()
-_ANALYSIS_CACHE_TTL = 300  # Cache TTL in seconds (5 minutes) - share results to save LLM costs
+_ANALYSIS_CACHE_TTL = 5*60  # 分析缓存时间（秒）
 
 # L2 Redis cache key prefix (cross-process sharing for multi-instance deployments)
 _REDIS_CACHE_PREFIX = "fa_cache:"

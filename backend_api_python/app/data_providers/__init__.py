@@ -61,8 +61,8 @@ CACHE_TTL = {
     # Macro sentiment (Fear&Greed, VIX, DXY...) — daily-ish cadence so 6h
     # is fine. SWR lets us return the previous payload while we refresh.
     "market_sentiment": 21600,
-    # Opportunity scanner — heavy compute, 1h is the right cadence.
-    "trading_opportunities": 3600,
+    # Opportunity scanner — heavy compute, 1h is the right cadence. 3600 -> 600 10分钟跑一次
+    "trading_opportunities": 600,   
 }
 
 _DEFAULT_TTL = 60
