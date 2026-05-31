@@ -244,7 +244,7 @@ def analyze_opportunities_crypto(opportunities: list):
         logger.warning("analyze_opportunities_crypto: No crypto data available")
         return
 
-    for coin in (crypto_data or [])[:20]:
+    for coin in (crypto_data or [])[:100]:
         change = safe_float(coin.get("change_24h", 0))
         change_7d = safe_float(coin.get("change_7d", 0))
         symbol = coin.get("symbol", "")
