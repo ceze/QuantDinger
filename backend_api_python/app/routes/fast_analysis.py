@@ -12,6 +12,7 @@ from app.utils.logger import get_logger
 from app.services.fast_analysis import get_fast_analysis_service
 from app.services.analysis_memory import get_analysis_memory
 from app.services.billing_service import get_billing_service
+from flask_cors import cross_origin
 
 logger = get_logger(__name__)
 
@@ -111,7 +112,8 @@ def _release_inflight(key: str):
 
 
 @fast_analysis_bp.route('/analyze', methods=['POST'])
-@login_required
+#@login_required    #  disable login required
+@cross_origin() # Allow CORS for this route
 def analyze():
     """
     Fast AI analysis for any symbol.

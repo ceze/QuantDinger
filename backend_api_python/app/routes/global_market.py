@@ -29,6 +29,7 @@ from flask import Blueprint, jsonify, request
 
 from app.utils.logger import get_logger
 from app.utils.auth import login_required
+from flask_cors import cross_origin
 
 # Unified data-provider layer.
 #
@@ -302,7 +303,8 @@ def _compute_trading_opportunities():
 
 
 @global_market_bp.route("/opportunities", methods=["GET"])
-@login_required
+#@login_required    #  disable login required
+@cross_origin() # Allow CORS for this route
 def trading_opportunities():
     """Scan for trading opportunities across Crypto, US/CN/HK Stocks, and Forex."""
     try:
