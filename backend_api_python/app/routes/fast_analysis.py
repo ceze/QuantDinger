@@ -22,6 +22,12 @@ fast_analysis_bp = Blueprint('fast_analysis', __name__)
 _analysis_inflight_lock = threading.Lock()
 _analysis_inflight = {}  # key -> expire_ts
 
+# Result cache: share analysis result among concurrent requests for same symbol
+# Key: "market:symbol:timeframe:language" -> {"result": ..., "timestamp": ...}
+_analysis_result_cache = {}
+_analysis_cache_lock = threading.Lock()
+_ANALYSIS_CACHE_TTL = 300  # Cache TTL in seconds (5 minutes) - share results to save LLM costs
+
 
 def _try_refund_credits(user_id: int, amount: int, remark: str):
     """Best-effort async refund when task fails after pre-charge."""
@@ -147,19 +153,64 @@ def analyze():
                 'data': None
             }), 400
         
-        # Support anonymous access: use IP-based tracking for unauthenticated users
+        # Support anonymous access: use unified user_id=88888 for unauthenticated users
         user_id = getattr(g, 'user_id', None)
         
         if not user_id:
-            # Anonymous user: use client IP for inflight tracking
-            client_ip = request.remote_addr or 'anonymous'
-            inflight_key = _build_inflight_key(client_ip, market, symbol, timeframe)
-            logger.info(f"Anonymous analysis request from {client_ip}: {market}:{symbol}")
-        else:
-            # Authenticated user: use user_id for tracking
-            inflight_key = _build_inflight_key(user_id, market, symbol, timeframe)
+            # Anonymous user: use unified ID 88888
+            user_id = 88888
+            logger.info(f"Anonymous analysis request (user_id={user_id}): {market}:{symbol}")
+        
+        # Build cache key (independent of user_id - shared across all users)
+        cache_key = f"{market.upper()}:{symbol.upper()}:{timeframe.upper()}:{language}"
+        
+        # Check result cache first (fast path)
+        with _analysis_cache_lock:
+            if cache_key in _analysis_result_cache:
+                cached = _analysis_result_cache[cache_key]
+                if time.time() - cached['timestamp'] < _ANALYSIS_CACHE_TTL:
+                    logger.info(f"Cache hit for {cache_key}, returning cached result")
+                    return jsonify({
+                        'code': 1,
+                        'msg': 'success (cached)',
+                        'data': {
+                            **cached['result'],
+                            'market': market,
+                            'symbol': symbol,
+                            'timeframe': timeframe,
+                            'credits_charged': 0,
+                            'remaining_credits': None,
+                            '_cached': True
+                        }
+                    })
+                else:
+                    # Expired, remove from cache
+                    del _analysis_result_cache[cache_key]
             
+        # Build inflight key (per-user to prevent duplicate charges)
+        inflight_key = _build_inflight_key(user_id, market, symbol, timeframe)
         if not _acquire_inflight(inflight_key, ttl_sec=90):
+            # Another request from same user is in progress
+            # Wait a bit and try to get the cached result
+            time.sleep(0.5)
+            with _analysis_cache_lock:
+                if cache_key in _analysis_result_cache:
+                    cached = _analysis_result_cache[cache_key]
+                    logger.info(f"Duplicate request from same user, returning cached result for {cache_key}")
+                    return jsonify({
+                        'code': 1,
+                        'msg': 'success (cached)',
+                        'data': {
+                            **cached['result'],
+                            'market': market,
+                            'symbol': symbol,
+                            'timeframe': timeframe,
+                            'credits_charged': 0,
+                            'remaining_credits': None,
+                            '_cached': True
+                        }
+                    })
+            
             return jsonify({
                 'code': 0,
                 'msg': 'Analysis already in progress for this symbol/timeframe. Please wait.',
@@ -283,6 +334,14 @@ def analyze():
                 'msg': result['error'],
                 'data': result
             }), 500
+        
+        # Cache the result for other concurrent requests
+        with _analysis_cache_lock:
+            _analysis_result_cache[cache_key] = {
+                'result': result,
+                'timestamp': time.time()
+            }
+            logger.info(f"Cached analysis result for {cache_key}")
         
         # memory_id is already set in service.analyze() -> _store_analysis_memory()
         # No need to store again here (would create duplicates)
