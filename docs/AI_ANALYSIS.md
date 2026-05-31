@@ -42,3 +42,10 @@ https://dinger-front123.ktx.app/api/global-market/opportunities?_t=1780233414101
  # 所以如果想增加雷达扫描的币种，
  # opportunities.py 第 247 行
  CoinGecko Top 20 出现在探测雷达里，修改这里
+
+
+
+
+
+
+docker buildx build --platform linux/amd64 -t registry-intl.cn-hongkong.aliyuncs.com/madex/quantdinger-linux:latest .
