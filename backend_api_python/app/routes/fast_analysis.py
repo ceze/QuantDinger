@@ -112,8 +112,8 @@ def _release_inflight(key: str):
 
 
 @fast_analysis_bp.route('/analyze', methods=['POST'])
-#@login_required    #  disable login required
-@cross_origin() # Allow CORS for this route
+# @login_required  # Disabled: allow anonymous access
+@cross_origin()  # Allow CORS for this route
 def analyze():
     """
     Fast AI analysis for any symbol.
@@ -147,12 +147,18 @@ def analyze():
                 'data': None
             }), 400
         
-        # Get current user's ID to associate analysis with user
+        # Support anonymous access: use IP-based tracking for unauthenticated users
         user_id = getattr(g, 'user_id', None)
+        
         if not user_id:
-            return jsonify({'code': 0, 'msg': 'Unauthorized', 'data': None}), 401
-
-        inflight_key = _build_inflight_key(user_id, market, symbol, timeframe)
+            # Anonymous user: use client IP for inflight tracking
+            client_ip = request.remote_addr or 'anonymous'
+            inflight_key = _build_inflight_key(client_ip, market, symbol, timeframe)
+            logger.info(f"Anonymous analysis request from {client_ip}: {market}:{symbol}")
+        else:
+            # Authenticated user: use user_id for tracking
+            inflight_key = _build_inflight_key(user_id, market, symbol, timeframe)
+            
         if not _acquire_inflight(inflight_key, ttl_sec=90):
             return jsonify({
                 'code': 0,
@@ -160,52 +166,60 @@ def analyze():
                 'data': {'in_progress': True}
             }), 429
 
-        # Billing / credits (best-effort)
+        # Billing / credits (best-effort) - Anonymous users skip billing
         credits_charged = 0
         remaining_credits = None
         billing_consumed = False
         billing = None
         try:
-            billing = get_billing_service()
-            if billing.is_billing_enabled():
-                credits_charged = int(billing.get_feature_cost('ai_analysis') or 0)
-                if credits_charged > 0:
-                    ok, msg = billing.check_and_consume(
-                        user_id=int(user_id),
-                        feature='ai_analysis',
-                        reference_id=f"fast_analysis_{market}:{symbol}:{timeframe}"
-                    )
-                    if not ok:
-                        # Standardize insufficient credits message
-                        if str(msg or "").startswith('insufficient_credits'):
-                            # Format: insufficient_credits:<current>:<cost>
-                            parts = str(msg).split(':')
-                            cur = float(parts[1]) if len(parts) >= 2 else 0.0
-                            req = float(parts[2]) if len(parts) >= 3 else float(credits_charged)
-                            return jsonify({
-                                'code': 0,
-                                'msg': 'Insufficient credits',
-                                'data': {
-                                    'required': req,
-                                    'current': cur,
-                                    'shortage': max(0.0, req - cur),
-                                }
-                            }), 400
-                        return jsonify({'code': 0, 'msg': f'Failed to deduct credits: {msg}', 'data': None}), 500
-                    billing_consumed = True
-                    # Query remaining credits after successful consumption
-                    try:
-                        remaining_credits = float(billing.get_user_credits(int(user_id)))
-                    except Exception:
-                        remaining_credits = None
+            if user_id:  # Only charge authenticated users
+                billing = get_billing_service()
+                if billing.is_billing_enabled():
+                    credits_charged = int(billing.get_feature_cost('ai_analysis') or 0)
+                    if credits_charged > 0:
+                        ok, msg = billing.check_and_consume(
+                            user_id=int(user_id),
+                            feature='ai_analysis',
+                            reference_id=f"fast_analysis_{market}:{symbol}:{timeframe}"
+                        )
+                        if not ok:
+                            # Standardize insufficient credits message
+                            if str(msg or "").startswith('insufficient_credits'):
+                                # Format: insufficient_credits:<current>:<cost>
+                                parts = str(msg).split(':')
+                                cur = float(parts[1]) if len(parts) >= 2 else 0.0
+                                req = float(parts[2]) if len(parts) >= 3 else float(credits_charged)
+                                return jsonify({
+                                    'code': 0,
+                                    'msg': 'Insufficient credits',
+                                    'data': {
+                                        'required': req,
+                                        'current': cur,
+                                        'shortage': max(0.0, req - cur),
+                                    }
+                                }), 400
+                            return jsonify({'code': 0, 'msg': f'Failed to deduct credits: {msg}', 'data': None}), 500
+                        billing_consumed = True
+                        # Query remaining credits after successful consumption
+                        try:
+                            remaining_credits = float(billing.get_user_credits(int(user_id)))
+                        except Exception:
+                            remaining_credits = None
         except Exception as e:
             # Billing failure should not crash analysis by default, but should be visible in logs.
             logger.warning(f"Billing check failed (skipped): {e}", exc_info=True)
         
         service = get_fast_analysis_service()
 
-        # Async submit mode: record "processing" immediately and return task id.
+        # Async submit mode: requires authentication
         if async_submit:
+            if not user_id:
+                return jsonify({
+                    'code': 0,
+                    'msg': 'Async analysis requires login. Please authenticate or use synchronous mode.',
+                    'data': None
+                }), 401
+            
             memory = get_analysis_memory()
             pending_id = memory.create_pending_task(
                 market=market,
