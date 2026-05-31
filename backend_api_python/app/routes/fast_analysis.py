@@ -22,11 +22,102 @@ fast_analysis_bp = Blueprint('fast_analysis', __name__)
 _analysis_inflight_lock = threading.Lock()
 _analysis_inflight = {}  # key -> expire_ts
 
-# Result cache: share analysis result among concurrent requests for same symbol
+# L1 Result cache (in-process dict, fastest): share analysis result among concurrent requests
 # Key: "market:symbol:timeframe:language" -> {"result": ..., "timestamp": ...}
 _analysis_result_cache = {}
 _analysis_cache_lock = threading.Lock()
 _ANALYSIS_CACHE_TTL = 300  # Cache TTL in seconds (5 minutes) - share results to save LLM costs
+
+# L2 Redis cache key prefix (cross-process sharing for multi-instance deployments)
+_REDIS_CACHE_PREFIX = "fa_cache:"
+
+# Lazy-loaded CacheManager (Redis or fallback MemoryCache)
+_cache_manager = None
+_cache_manager_lock = threading.Lock()
+
+
+def _get_cache_manager():
+    """Lazy-load CacheManager. Returns None on any failure (graceful degradation)."""
+    global _cache_manager
+    if _cache_manager is not None:
+        return _cache_manager
+    with _cache_manager_lock:
+        if _cache_manager is not None:
+            return _cache_manager
+        try:
+            from app.utils.cache import CacheManager
+            _cache_manager = CacheManager()
+            backend = "Redis" if _cache_manager.is_redis else "MemoryCache"
+            logger.info(f"Fast analysis L2 cache backend: {backend}")
+            return _cache_manager
+        except Exception as e:
+            logger.info(f"L2 cache unavailable, using L1 memory only: {e}")
+            return None
+
+
+def _cache_get(cache_key: str):
+    """
+    Two-tier cache lookup: L1 (in-process dict) -> L2 (Redis/CacheManager).
+    Returns cached result dict on hit, None on miss.
+    On L2 hit, backfills L1 for subsequent fast access.
+    """
+    # L1: in-process dict (fastest)
+    with _analysis_cache_lock:
+        if cache_key in _analysis_result_cache:
+            cached = _analysis_result_cache[cache_key]
+            if time.time() - cached['timestamp'] < _ANALYSIS_CACHE_TTL:
+                return cached['result'], 'memory'
+            else:
+                del _analysis_result_cache[cache_key]
+
+    # L2: Redis / CacheManager
+    cm = _get_cache_manager()
+    if cm is not None:
+        try:
+            redis_key = f"{_REDIS_CACHE_PREFIX}{cache_key}"
+            data = cm.get(redis_key)
+            if data and isinstance(data, dict):
+                result = data.get('result')
+                ts = data.get('timestamp', 0)
+                if result and time.time() - ts < _ANALYSIS_CACHE_TTL:
+                    # Backfill L1 for subsequent fast access
+                    with _analysis_cache_lock:
+                        _analysis_result_cache[cache_key] = {
+                            'result': result,
+                            'timestamp': ts
+                        }
+                    return result, 'redis'
+        except Exception as e:
+            logger.debug(f"L2 cache read failed for {cache_key}: {e}")
+
+    return None, None
+
+
+def _cache_set(cache_key: str, result: dict):
+    """
+    Write to both L1 (in-process dict) and L2 (Redis/CacheManager).
+    L2 failure is silently ignored (graceful degradation).
+    """
+    ts = time.time()
+    # L1: always write
+    with _analysis_cache_lock:
+        _analysis_result_cache[cache_key] = {
+            'result': result,
+            'timestamp': ts
+        }
+
+    # L2: best-effort write to Redis
+    cm = _get_cache_manager()
+    if cm is not None:
+        try:
+            redis_key = f"{_REDIS_CACHE_PREFIX}{cache_key}"
+            cm.set(redis_key, {'result': result, 'timestamp': ts}, ttl=_ANALYSIS_CACHE_TTL)
+            logger.info(f"Cached result to L1+L2 for {cache_key}")
+            return
+        except Exception as e:
+            logger.debug(f"L2 cache write failed for {cache_key}: {e}")
+
+    logger.info(f"Cached result to L1 only for {cache_key}")
 
 
 def _try_refund_credits(user_id: int, amount: int, remark: str):
@@ -77,14 +168,9 @@ def _run_async_analysis_task(task_memory_id: int, market: str, symbol: str, lang
                 remark=f'Auto refund: async fast-analysis failed ({market}:{symbol}:{timeframe})'
             )
         else:
-            # Cache successful result for subsequent requests
+            # Cache successful result to L1+L2 for subsequent requests
             cache_key = _build_cache_key(market, symbol, timeframe, language)
-            with _analysis_cache_lock:
-                _analysis_result_cache[cache_key] = {
-                    'result': result,
-                    'timestamp': time.time()
-                }
-            logger.info(f"Async task cached result for {cache_key}")
+            _cache_set(cache_key, result)
 
         # analyze() already stores a separate memory row; remove it to avoid duplicates.
         auto_memory_id = result.get("memory_id")
@@ -177,31 +263,24 @@ def analyze():
         # Build cache key (independent of user_id - shared across all users)
         cache_key = _build_cache_key(market, symbol, timeframe, language)
         
-        # Check result cache first (fast path)
-        with _analysis_cache_lock:
-            if cache_key in _analysis_result_cache:
-                cached = _analysis_result_cache[cache_key]
-                if time.time() - cached['timestamp'] < _ANALYSIS_CACHE_TTL:
-                    logger.info(f"Cache hit for {cache_key}, returning cached result")
-                    return jsonify({
-                        'code': 1,
-                        'msg': 'success (cached)',
-                        'data': {
-                            **cached['result'],
-                            'market': market,
-                            'symbol': symbol,
-                            'timeframe': timeframe,
-                            'credits_charged': 0,
-                            'remaining_credits': None,
-                            '_cached': True
-                        }
-                    })
-                else:
-                    # Expired, remove from cache
-                    del _analysis_result_cache[cache_key]
-                    logger.info(f"Cache expired for {cache_key}, performing fresh analysis")
-            else:
-                logger.info(f"Cache miss for {cache_key}, performing fresh analysis")
+        # Check result cache: L1 (memory) -> L2 (Redis)
+        cached_result, cache_source = _cache_get(cache_key)
+        if cached_result is not None:
+            logger.info(f"Cache hit ({cache_source}) for {cache_key}, returning cached result")
+            return jsonify({
+                'code': 1,
+                'msg': 'success (cached)',
+                'data': {
+                    **cached_result,
+                    'market': market,
+                    'symbol': symbol,
+                    'timeframe': timeframe,
+                    'credits_charged': 0,
+                    'remaining_credits': None,
+                    '_cached': True
+                }
+            })
+        logger.info(f"Cache miss (L1+L2) for {cache_key}, performing fresh analysis")
             
         # Build inflight key (per-user to prevent duplicate charges)
         inflight_key = _build_inflight_key(user_id, market, symbol, timeframe)
@@ -209,23 +288,22 @@ def analyze():
             # Another request from same user is in progress
             # Wait a bit and try to get the cached result
             time.sleep(0.5)
-            with _analysis_cache_lock:
-                if cache_key in _analysis_result_cache:
-                    cached = _analysis_result_cache[cache_key]
-                    logger.info(f"Duplicate request from same user, returning cached result for {cache_key}")
-                    return jsonify({
-                        'code': 1,
-                        'msg': 'success (cached)',
-                        'data': {
-                            **cached['result'],
-                            'market': market,
-                            'symbol': symbol,
-                            'timeframe': timeframe,
-                            'credits_charged': 0,
-                            'remaining_credits': None,
-                            '_cached': True
-                        }
-                    })
+            cached_result, cache_source = _cache_get(cache_key)
+            if cached_result is not None:
+                logger.info(f"Duplicate request from same user, returning cached result ({cache_source}) for {cache_key}")
+                return jsonify({
+                    'code': 1,
+                    'msg': 'success (cached)',
+                    'data': {
+                        **cached_result,
+                        'market': market,
+                        'symbol': symbol,
+                        'timeframe': timeframe,
+                        'credits_charged': 0,
+                        'remaining_credits': None,
+                        '_cached': True
+                    }
+                })
             
             return jsonify({
                 'code': 0,
@@ -280,32 +358,24 @@ def analyze():
 
         # Async submit mode: support anonymous users
         if async_submit:
-            # Check cache first before creating async task
-            with _analysis_cache_lock:
-                if cache_key in _analysis_result_cache:
-                    cached = _analysis_result_cache[cache_key]
-                    if time.time() - cached['timestamp'] < _ANALYSIS_CACHE_TTL:
-                        logger.info(f"Async submit cache hit for {cache_key}")
-                        return jsonify({
-                            'code': 1,
-                            'msg': 'success (cached)',
-                            'data': {
-                                **cached['result'],
-                                'market': market,
-                                'symbol': symbol,
-                                'timeframe': timeframe,
-                                'credits_charged': 0,
-                                'remaining_credits': None,
-                                '_cached': True
-                            }
-                        })
-                    else:
-                        # Cache expired
-                        del _analysis_result_cache[cache_key]
-                        logger.info(f"Async submit cache expired for {cache_key}")
-                else:
-                    # Cache miss
-                    logger.info(f"Async submit cache miss for {cache_key}")
+            # Check cache: L1 (memory) -> L2 (Redis) before creating async task
+            cached_result, cache_source = _cache_get(cache_key)
+            if cached_result is not None:
+                logger.info(f"Async submit cache hit ({cache_source}) for {cache_key}")
+                return jsonify({
+                    'code': 1,
+                    'msg': 'success (cached)',
+                    'data': {
+                        **cached_result,
+                        'market': market,
+                        'symbol': symbol,
+                        'timeframe': timeframe,
+                        'credits_charged': 0,
+                        'remaining_credits': None,
+                        '_cached': True
+                    }
+                })
+            logger.info(f"Async submit cache miss (L1+L2) for {cache_key}")
             
             # Anonymous users can use async mode with user_id=88888
             memory = get_analysis_memory()
@@ -372,13 +442,8 @@ def analyze():
                 'data': result
             }), 500
         
-        # Cache the result for other concurrent requests
-        with _analysis_cache_lock:
-            _analysis_result_cache[cache_key] = {
-                'result': result,
-                'timestamp': time.time()
-            }
-            logger.info(f"Cached analysis result for {cache_key}")
+        # Cache the result to L1+L2 for other concurrent requests
+        _cache_set(cache_key, result)
         
         # memory_id is already set in service.analyze() -> _store_analysis_memory()
         # No need to store again here (would create duplicates)
