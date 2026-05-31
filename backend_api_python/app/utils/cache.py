@@ -79,18 +79,42 @@ class CacheManager:
             import redis
             from app.config import RedisConfig
 
-            self._client = redis.Redis(
+            # Suppress CLIENT SETINFO on older Redis servers (< 7.2) / cloud Redis
+            # redis-py >= 5.0 auto-sends CLIENT SETINFO which old/cloud Redis rejects
+            # Must be set BEFORE creating any connection/pool
+            try:
+                redis.connection.CLIENT_SETINFO_KEY = None
+                redis.connection.CLIENT_SETINFO_VALUE = None
+            except AttributeError:
+                pass
+
+            pool = redis.ConnectionPool(
                 host=RedisConfig.HOST,
                 port=RedisConfig.PORT,
                 db=RedisConfig.DB,
                 password=RedisConfig.PASSWORD,
                 decode_responses=True,
                 socket_connect_timeout=RedisConfig.CONNECT_TIMEOUT,
-                socket_timeout=RedisConfig.SOCKET_TIMEOUT
+                socket_timeout=RedisConfig.SOCKET_TIMEOUT,
             )
-            self._client.ping()
-            self._use_redis = True
-            logger.info("Redis cache connected")
+            self._client = redis.Redis(connection_pool=pool)
+            
+            # Test connection - catch SETINFO errors gracefully
+            # redis-py >= 5.0 sends CLIENT SETINFO on first command, which old/cloud Redis rejects
+            try:
+                self._client.ping()
+                self._use_redis = True
+                logger.info("Redis cache connected")
+            except Exception as ping_err:
+                err_msg = str(ping_err).lower()
+                # If error contains "unknown command", assume it's SETINFO-related
+                # and still use Redis (connection itself works)
+                if "unknown command" in err_msg:
+                    # SETINFO not supported, but Redis connection itself works
+                    self._use_redis = True
+                    logger.info("Redis cache connected (SETINFO disabled for older server)")
+                else:
+                    raise
         except Exception as e:
             # Fall back silently (keep startup logs clean in local mode).
             logger.info(f"Redis is enabled but unavailable; using in-memory cache instead: {e}")
@@ -125,4 +149,3 @@ class CacheManager:
     @property
     def is_redis(self) -> bool:
         return self._use_redis
-

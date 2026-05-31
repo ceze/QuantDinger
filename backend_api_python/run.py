@@ -19,11 +19,11 @@ except Exception:
 try:
     from dotenv import load_dotenv
     this_dir = os.path.dirname(os.path.abspath(__file__))
-    # Primary: backend_api_python/.env (same dir as run.py)
-    load_dotenv(os.path.join(this_dir, ".env"), override=False)
-    # Fallback: repo-root/.env (one level up) for users who place .env at workspace root.
+    # Primary: backend_api_python/configs/.env
+    load_dotenv(os.path.join(this_dir, "configs", ".env"), override=False)
+    # Fallback: repo-root/configs/.env for users who place .env at workspace root.
     parent_dir = os.path.dirname(this_dir)
-    load_dotenv(os.path.join(parent_dir, ".env"), override=False)
+    load_dotenv(os.path.join(parent_dir, "configs", ".env"), override=False)
 except Exception:
     # python-dotenv is optional; environment variables can still be provided by the OS.
     pass
@@ -116,7 +116,7 @@ def main():
         new_key = _secrets.token_hex(32)
         os.environ["SECRET_KEY"] = new_key
         print("[AUTO] SECRET_KEY was default; generated random key for this session.")
-        print("[TIP]  Set a persistent SECRET_KEY in backend_api_python/.env for production.")
+        print("[TIP]  Set a persistent SECRET_KEY in backend_api_python/configs/.env for production.")
     
     print(f"Service starting at: http://{Config.HOST}:{Config.PORT}")
     

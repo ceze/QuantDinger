@@ -95,10 +95,10 @@ services:
       - backend_data:/app/data
       # Backend runtime config. Must exist as a *file* on the host — if missing,
       # docker silently creates a directory at the mount target and shadows
-      # /app/.env. The entrypoint will auto-generate SECRET_KEY on first start
+      # /app/configs/.env. The entrypoint will auto-generate SECRET_KEY on first start
       # and write it back through the bind mount, so the host file gets the
       # generated key persistently.
-      - ./backend.env:/app/.env
+      - ./backend.env:/app/configs/.env
     environment:
       - PYTHON_API_HOST=0.0.0.0
       - PYTHON_API_PORT=5000

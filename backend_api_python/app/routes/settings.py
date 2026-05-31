@@ -18,20 +18,20 @@ logger = get_logger(__name__)
 settings_bp = Blueprint('settings', __name__)
 
 # .env 文件路径
-ENV_FILE_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), '.env')
+ENV_FILE_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'configs', '.env')
 
 
 def _reload_runtime_env() -> None:
     """
     Reload .env into current process so settings take effect immediately.
-    Priority keeps backend_api_python/.env over repo-root/.env.
+    Priority keeps backend_api_python/configs/.env over repo-root/configs/.env.
     """
     backend_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
     root_dir = os.path.dirname(backend_dir)
 
     # Load root first, then backend .env to keep backend file higher priority
-    load_dotenv(os.path.join(root_dir, '.env'), override=True)
-    load_dotenv(os.path.join(backend_dir, '.env'), override=True)
+    load_dotenv(os.path.join(root_dir, 'configs', '.env'), override=True)
+    load_dotenv(os.path.join(backend_dir, 'configs', '.env'), override=True)
 
 
 def _refresh_runtime_services() -> None:

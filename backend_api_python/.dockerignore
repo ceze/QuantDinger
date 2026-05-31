@@ -23,7 +23,6 @@ logs/
 *.db
 
 # Environment
-.env
 .env.local
 
 # Data (在 docker-compose 中挂载)

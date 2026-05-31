@@ -102,7 +102,7 @@ services:
       - backend_logs:/app/logs
       - backend_data:/app/data
       # Mount .env for runtime config and admin-panel updates
-      - ./backend_api_python/.env:/app/.env
+      - ./backend_api_python/configs/.env:/app/configs/.env
     environment:
       - PYTHON_API_HOST=0.0.0.0
       - PYTHON_API_PORT=5000
