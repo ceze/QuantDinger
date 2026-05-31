@@ -2611,6 +2611,11 @@ IMPORTANT:
         try:
             from app.utils.db import get_db_connection
             
+            # Skip saving for anonymous users (user_id=88888 doesn't exist in qd_users)
+            if user_id and int(user_id) == 88888:
+                logger.debug(f"Skipping analysis task save for anonymous user {user_id}")
+                return None
+            
             market = result.get("market", "")
             symbol = result.get("symbol", "")
             model = result.get("model", "")
