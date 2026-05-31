@@ -468,9 +468,8 @@ AI_CALIBRATION_MIN_SAMPLES=80
 AI_ANALYSIS_CONSENSUS_TIMEFRAMES=1D,4H
 
 # Redis cache (auto-configured by docker-compose; set CACHE_ENABLED=true to use)
-REDIS_HOST=r-3ns722y4vnvvww2hy2.redis.rds.aliyuncs.com
+REDIS_HOST=r-3nsuq5ts75f0re3y1s.redis.cnhk.rds.aliyuncs.com
 REDIS_PORT=6379
-REDIS_DB=8
 CACHE_ENABLED=true
 
 # Internal
