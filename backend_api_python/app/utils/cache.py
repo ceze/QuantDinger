@@ -79,45 +79,48 @@ class CacheManager:
             import redis
             from app.config import RedisConfig
 
-            # Suppress CLIENT SETINFO on older Redis servers (< 7.2) / cloud Redis
-            # redis-py >= 5.0 auto-sends CLIENT SETINFO which old/cloud Redis rejects
-            # Must be set BEFORE creating any connection/pool
-            try:
-                redis.connection.CLIENT_SETINFO_KEY = None
-                redis.connection.CLIENT_SETINFO_VALUE = None
-            except AttributeError:
-                pass
+            # Log connection details (mask password for security)
+            password_info = "(set)" if RedisConfig.PASSWORD else "(none)"
+            logger.info(
+                f"Attempting Redis connection: "
+                f"host={RedisConfig.HOST}, port={RedisConfig.PORT}, "
+                f"db={RedisConfig.DB}, password={password_info}"
+            )
 
-            pool = redis.ConnectionPool(
+            self._client = redis.Redis(
                 host=RedisConfig.HOST,
                 port=RedisConfig.PORT,
                 db=RedisConfig.DB,
                 password=RedisConfig.PASSWORD,
                 decode_responses=True,
                 socket_connect_timeout=RedisConfig.CONNECT_TIMEOUT,
-                socket_timeout=RedisConfig.SOCKET_TIMEOUT,
+                socket_timeout=RedisConfig.SOCKET_TIMEOUT
             )
-            self._client = redis.Redis(connection_pool=pool)
-            
-            # Test connection - catch SETINFO errors gracefully
-            # redis-py >= 5.0 sends CLIENT SETINFO on first command, which old/cloud Redis rejects
-            try:
-                self._client.ping()
-                self._use_redis = True
-                logger.info("Redis cache connected")
-            except Exception as ping_err:
-                err_msg = str(ping_err).lower()
-                # If error contains "unknown command", assume it's SETINFO-related
-                # and still use Redis (connection itself works)
-                if "unknown command" in err_msg:
-                    # SETINFO not supported, but Redis connection itself works
-                    self._use_redis = True
-                    logger.info("Redis cache connected (SETINFO disabled for older server)")
-                else:
-                    raise
+            self._client.ping()
+            self._use_redis = True
+            logger.info("Redis cache connected successfully")
         except Exception as e:
-            # Fall back silently (keep startup logs clean in local mode).
-            logger.info(f"Redis is enabled but unavailable; using in-memory cache instead: {e}")
+            # Detailed error logging for debugging
+            error_type = type(e).__name__
+            error_details = str(e)
+            
+            # Provide helpful hints based on error type
+            hint = ""
+            if "invalid username-password" in error_details.lower() or "wrong number of arguments" in error_details.lower():
+                hint = " [Hint: Check REDIS_PASSWORD in .env - password may be incorrect]"
+            elif "Connection refused" in error_details:
+                hint = " [Hint: Redis server may not be running or REDIS_HOST/REDIS_PORT is wrong]"
+            elif "Authentication required" in error_details:
+                hint = " [Hint: Redis requires password but REDIS_PASSWORD is not set in .env]"
+            elif "disabled" in error_details.lower():
+                hint = " [Hint: Redis user may be disabled or ACL restricted]"
+            
+            logger.error(
+                f"Redis connection failed: {error_type}: {error_details}{hint}\n"
+                f"  Config: host={RedisConfig.HOST}, port={RedisConfig.PORT}, "
+                f"db={RedisConfig.DB}, password_set={bool(RedisConfig.PASSWORD)}\n"
+                f"  Falling back to in-memory cache"
+            )
             self._client = MemoryCache()
             self._use_redis = False
     
@@ -149,3 +152,4 @@ class CacheManager:
     @property
     def is_redis(self) -> bool:
         return self._use_redis
+
