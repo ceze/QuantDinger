@@ -128,14 +128,14 @@ def fetch_crypto_prices(*, fast: bool = False) -> List[Dict[str, Any]]:
     """Fetch top crypto prices — try CCXT → yfinance → CoinGecko."""
     if not fast:
         result = fetch_crypto_prices_ccxt()
-        if result and len(result) >= 5:
+        if result and len(result) >= 50:
             logger.info("Fetched %d crypto prices via CCXT", len(result))
             return result
 
-    result = fetch_crypto_prices_yfinance()
-    if result and len(result) >= 5:
-        logger.info("Fetched %d crypto prices via yfinance", len(result))
-        return result
+    # result = fetch_crypto_prices_yfinance()
+    # if result and len(result) >= 50:
+    #     logger.info("Fetched %d crypto prices via yfinance", len(result))
+    #     return result
 
     try:
         url = "https://api.coingecko.com/api/v3/coins/markets"
