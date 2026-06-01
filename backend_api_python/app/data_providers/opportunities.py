@@ -14,7 +14,8 @@ from app.data_providers.forex import fetch_forex_pairs
 
 logger = get_logger(__name__)
 
-
+# AI分析币种数量，按市值排序
+_AI_ANALYZE_CYPTO_COUNT_ = 50
 # ---------------------------------------------------------------------------
 # Price fetchers for opportunity scanning
 # ---------------------------------------------------------------------------
@@ -148,8 +149,8 @@ def fetch_local_stock_opportunity_prices(market: str, limit: int = 15, *, fast: 
 
     _FALLBACK_SYMBOLS = {
         "USStock": [
-            #{"symbol": "AAPL", "name": "Apple"}, {"symbol": "MSFT", "name": "Microsoft"},
-            # {"symbol": "GOOGL", "name": "Alphabet"}, {"symbol": "AMZN", "name": "Amazon"},
+            {"symbol": "AAPL", "name": "Apple"}, {"symbol": "MSFT", "name": "Microsoft"},
+            #{"symbol": "GOOGL", "name": "Alphabet"}, {"symbol": "AMZN", "name": "Amazon"},
             # {"symbol": "TSLA", "name": "Tesla"}, {"symbol": "NVDA", "name": "NVIDIA"},
             # {"symbol": "META", "name": "Meta"}, {"symbol": "NFLX", "name": "Netflix"},
             # {"symbol": "AMD", "name": "AMD"}, {"symbol": "CRM", "name": "Salesforce"},
@@ -159,7 +160,7 @@ def fetch_local_stock_opportunity_prices(market: str, limit: int = 15, *, fast: 
             # {"symbol": "QCOM", "name": "Qualcomm"},
         ],
         "CNStock": [
-            # {"symbol": "600519", "name": "贵州茅台"}, {"symbol": "000001", "name": "平安银行"},
+            #{"symbol": "600519", "name": "贵州茅台"}, {"symbol": "000001", "name": "平安银行"},
             # {"symbol": "300750", "name": "宁德时代"}, {"symbol": "601318", "name": "中国平安"},
             # {"symbol": "600036", "name": "招商银行"}, {"symbol": "002594", "name": "比亚迪"},
             # {"symbol": "600276", "name": "恒瑞医药"}, {"symbol": "601899", "name": "紫金矿业"},
@@ -171,7 +172,7 @@ def fetch_local_stock_opportunity_prices(market: str, limit: int = 15, *, fast: 
             # {"symbol": "601012", "name": "隆基绿能"}, {"symbol": "002415", "name": "海康威视"},
         ],
         "HKStock": [
-            # {"symbol": "00700", "name": "腾讯控股"}, {"symbol": "09988", "name": "阿里巴巴-W"},
+            #{"symbol": "00700", "name": "腾讯控股"}, {"symbol": "09988", "name": "阿里巴巴-W"},
             # {"symbol": "03690", "name": "美团-W"}, {"symbol": "01810", "name": "小米集团-W"},
             # {"symbol": "01299", "name": "友邦保险"}, {"symbol": "00939", "name": "建设银行"},
             # {"symbol": "02318", "name": "中国平安"}, {"symbol": "09618", "name": "京东集团-SW"},
@@ -244,7 +245,7 @@ def analyze_opportunities_crypto(opportunities: list):
         logger.warning("analyze_opportunities_crypto: No crypto data available")
         return
 
-    for coin in (crypto_data or [])[:100]:
+    for coin in (crypto_data or [])[:_AI_ANALYZE_CYPTO_COUNT_]:
         change = safe_float(coin.get("change_24h", 0))
         change_7d = safe_float(coin.get("change_7d", 0))
         symbol = coin.get("symbol", "")

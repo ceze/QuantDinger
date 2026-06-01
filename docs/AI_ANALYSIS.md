@@ -41,9 +41,20 @@ https://dinger-front123.ktx.app/api/global-market/opportunities?_t=1780233414101
 
  # 所以如果想增加雷达扫描的币种，
  # opportunities.py 第 247 行
- CoinGecko Top 20 出现在探测雷达里，修改这里
+ CoinGecko Top 20 出现在探测雷达里，修改这里100
 
-
+# crypto.py里 fetch_crypto_prices_ccxt 
+# 币种价格从coingecko拉取，数量per_page 改为300
+url = "https://api.coingecko.com/api/v3/coins/markets"
+        params = {
+            "vs_currency": "usd",
+            "order": "market_cap_desc",
+            "per_page": 300,
+            "page": 1,
+            "sparkline": False,
+            "price_change_percentage": "24h,7d",
+        }
+https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=30&page=1&sparkline=false&price_change_percentage=24h%2C7d
 
 
 

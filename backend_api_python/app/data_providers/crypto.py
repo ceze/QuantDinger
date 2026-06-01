@@ -33,9 +33,16 @@ def fetch_crypto_prices_ccxt() -> List[Dict[str, Any]]:
         crypto_source = CryptoDataSource()
 
         symbols = [
-            "BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT", "XRP/USDT",
-            "ADA/USDT", "DOGE/USDT", "AVAX/USDT", "DOT/USDT", "POL/USDT",
-            "LINK/USDT", "LTC/USDT", "UNI/USDT", "ATOM/USDT", "XLM/USDT",
+            "BTC/USDT", "ETH/USDT", "BNB/USDT", "XRP/USDT", "SOL/USDT", "TRX/USDT", "DOGE/USDT", "ADA/USDT",
+            "LINK/USDT", "AVAX/USDT", "XLM/USDT", "TON/USDT", "SHIB/USDT", "HBAR/USDT", "SUI/USDT", "BCH/USDT", "DOT/USDT",
+            "LTC/USDT", "PEPE/USDT", "UNI/USDT", "APT/USDT", "NEAR/USDT", "ICP/USDT", "ETC/USDT", "ONDO/USDT", "AAVE/USDT", "POL/USDT",
+            "MNT/USDT", "VET/USDT", "RENDER/USDT", "ATOM/USDT", "FIL/USDT", "ALGO/USDT", "ARB/USDT", "OP/USDT", "SEI/USDT", "INJ/USDT",
+            "FET/USDT", "TAO/USDT", "TIA/USDT", "IMX/USDT", "JUP/USDT", "WLD/USDT", "BONK/USDT", "GRT/USDT", "MKR/USDT", "QNT/USDT",
+            "FLOW/USDT", "SAND/USDT", "MANA/USDT", "THETA/USDT", "KAS/USDT", "PYTH/USDT", "RUNE/USDT", "FLR/USDT", "JASMY/USDT", "BRETT/USDT",
+            "STRK/USDT", "ENA/USDT", "LDO/USDT", "EGLD/USDT", "KCS/USDT", "AXS/USDT", "BEAM/USDT", "CFX/USDT", "CHZ/USDT", "GALA/USDT",
+            "DYDX/USDT", "PENDLE/USDT", "AKT/USDT", "CRV/USDT", "SNX/USDT", "COMP/USDT", "ZEC/USDT", "ROSE/USDT", "ZRO/USDT", "1INCH/USDT",
+            "MINA/USDT", "CKB/USDT", "KAVA/USDT", "IOTA/USDT", "WIF/USDT", "NOT/USDT", "ORDI/USDT", "APE/USDT", "GMX/USDT", "BLUR/USDT",
+            "SAFE/USDT", "ARKM/USDT", "ALT/USDT", "ZK/USDT", "SUPER/USDT", "CELO/USDT", "DASH/USDT", "BAT/USDT", "ANKR/USDT", "HOT/USDT"
         ]
 
         result = []
@@ -135,7 +142,7 @@ def fetch_crypto_prices(*, fast: bool = False) -> List[Dict[str, Any]]:
         params = {
             "vs_currency": "usd",
             "order": "market_cap_desc",
-            "per_page": 30,
+            "per_page": 100,
             "page": 1,
             "sparkline": False,
             "price_change_percentage": "24h,7d",
