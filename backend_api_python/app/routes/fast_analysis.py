@@ -3,7 +3,8 @@ Fast Analysis API Routes
 
 New high-performance analysis endpoints that replace the slow multi-agent system.
 """
-from flask import Blueprint, request, jsonify, g
+from flask import g, jsonify, request
+from app.openapi.blueprint import HumanBlueprint as Blueprint
 import threading
 import time
 
@@ -16,7 +17,7 @@ from flask_cors import cross_origin
 
 logger = get_logger(__name__)
 
-fast_analysis_bp = Blueprint('fast_analysis', __name__)
+fast_analysis_blp = Blueprint('fast_analysis', __name__)
 
 # In-memory in-flight guard to avoid duplicate analysis charges caused by rapid repeated clicks.
 _analysis_inflight_lock = threading.Lock()
@@ -220,24 +221,20 @@ def _release_inflight(key: str):
         _analysis_inflight.pop(key, None)
 
 
-@fast_analysis_bp.route('/analyze', methods=['POST'])
+@fast_analysis_blp.route('/analyze', methods=['POST'])
 # @login_required  # Disabled: allow anonymous access
 @cross_origin()  # Allow CORS for this route
 def analyze():
     """
     Fast AI analysis for any symbol.
-    
-    POST /api/fast-analysis/analyze
-    Body: {
-        "market": "Crypto" | "USStock" | "Forex" | ...,
-        "symbol": "BTC/USDT" | "AAPL" | ...,
-        "language": "zh-CN" | "en-US" (optional),
-        "model": "openai/gpt-4o" (optional),
-        "timeframe": "1D" (optional)
-    }
-    
-    Returns:
-        Fast analysis result with actionable recommendations.
+
+    Request body:
+        market (required): Crypto, USStock, Forex, etc.
+        symbol (required): e.g. BTC/USDT, AAPL
+        language (optional, default en-US): Response language
+        model (optional): LLM model id, e.g. openai/gpt-4o
+        timeframe (optional, default 1D): Analysis timeframe
+        async_submit (optional): Submit as background task
     """
     try:
         data = request.get_json() or {}
@@ -487,7 +484,7 @@ def analyze():
             pass
 
 
-@fast_analysis_bp.route('/analyze-legacy', methods=['POST'])
+@fast_analysis_blp.route('/analyze-legacy', methods=['POST'])
 @login_required
 def analyze_legacy():
     """
@@ -628,7 +625,7 @@ def analyze_legacy():
             pass
 
 
-@fast_analysis_bp.route('/history', methods=['GET'])
+@fast_analysis_blp.route('/history', methods=['GET'])
 # @login_required  # Disabled: allow anonymous access
 @cross_origin()  # Allow CORS for this route
 def get_history():
@@ -671,7 +668,7 @@ def get_history():
         }), 500
 
 
-@fast_analysis_bp.route('/history/all', methods=['GET'])
+@fast_analysis_blp.route('/history/all', methods=['GET'])
 # @login_required  # Disabled: allow anonymous access
 @cross_origin()  # Allow CORS for this route
 def get_all_history():
@@ -713,7 +710,7 @@ def get_all_history():
         }), 500
 
 
-@fast_analysis_bp.route('/history/<int:memory_id>', methods=['DELETE'])
+@fast_analysis_blp.route('/history/<int:memory_id>', methods=['DELETE'])
 @login_required
 def delete_history(memory_id: int):
     """
@@ -750,17 +747,15 @@ def delete_history(memory_id: int):
         }), 500
 
 
-@fast_analysis_bp.route('/feedback', methods=['POST'])
+@fast_analysis_blp.route('/feedback', methods=['POST'])
 @login_required
 def submit_feedback():
     """
     Submit user feedback on an analysis.
-    
-    POST /api/fast-analysis/feedback
-    Body: {
-        "memory_id": 123,
-        "feedback": "helpful" | "not_helpful" | "accurate" | "inaccurate"
-    }
+
+    Request body:
+        memory_id (required): Analysis history ID
+        feedback (required): helpful, not_helpful, accurate, or inaccurate
     """
     try:
         data = request.get_json() or {}
@@ -801,7 +796,7 @@ def submit_feedback():
         }), 500
 
 
-@fast_analysis_bp.route('/performance', methods=['GET'])
+@fast_analysis_blp.route('/performance', methods=['GET'])
 @login_required
 def get_performance():
     """
@@ -832,7 +827,7 @@ def get_performance():
         }), 500
 
 
-@fast_analysis_bp.route('/similar-patterns', methods=['GET'])
+@fast_analysis_blp.route('/similar-patterns', methods=['GET'])
 @login_required
 def get_similar_patterns():
     """
@@ -880,3 +875,6 @@ def get_similar_patterns():
             'msg': str(e),
             'data': None
         }), 500
+
+# openapi-compat: legacy import name
+fast_analysis_bp = fast_analysis_blp

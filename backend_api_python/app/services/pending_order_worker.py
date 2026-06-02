@@ -18,7 +18,27 @@ from app.services.signal_notifier import SignalNotifier
 from app.services.exchange_execution import load_strategy_configs, resolve_exchange_config, safe_exchange_config_for_log
 from app.services.live_trading.execution import place_order_from_signal
 from app.services.live_trading.factory import create_client
-from app.services.live_trading.records import apply_fill_to_local_position, record_trade
+from app.services.live_trading.records import (
+    apply_fill_to_local_position,
+    ensure_position_ledger_schema,
+    normalize_strategy_symbol,
+    record_trade,
+    strategy_allowed_symbols,
+)
+from app.services.live_trading.strategy_position_sync import (
+    apply_exchange_snapshot_to_strategy_ledger,
+    strategy_uses_fill_ledger,
+)
+from app.services.live_trading.account_positions import (
+    account_legs_from_exchange_maps,
+    sync_account_positions,
+)
+from app.services.live_trading.leg_context import (
+    credential_id_from_exchange_config,
+    resolve_leg_context,
+)
+from app.utils.trade_close_reason import is_exit_trade_type
+from app.services.live_trading.position_query import resolve_reduce_only_quantity
 from app.utils.pnl import calc_notional_value
 from app.services.live_trading.base import LiveTradingError
 from app.services.live_trading.binance import BinanceFuturesClient
@@ -60,7 +80,9 @@ logger = get_logger(__name__)
 
 # PositionSync: one exchange snapshot per credential per TTL window (many strategies
 # often share the same API key — without this we N× get_positions and trigger bans).
-_position_sync_snapshot_cache: Dict[str, Tuple[float, Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]] = {}
+_position_sync_snapshot_cache: Dict[
+    str, Tuple[float, Dict[str, Dict[str, float]], Dict[str, Dict[str, float]], Dict[str, Dict[str, str]]]
+] = {}
 _exchange_sync_backoff_until: Dict[str, float] = {}
 _position_sync_cache_lock = threading.Lock()
 
@@ -94,23 +116,24 @@ def _position_sync_cache_ttl_sec() -> float:
 
 def _get_position_sync_snapshot(
     cache_key: str,
-) -> Optional[Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]]:
+) -> Optional[Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]], Dict[str, Dict[str, str]]]]:
     now = time.time()
     with _position_sync_cache_lock:
         entry = _position_sync_snapshot_cache.get(cache_key)
         if not entry:
             return None
-        expires, exch_size, exch_entry = entry
+        expires, exch_size, exch_entry, inst_map = entry
         if now >= expires:
             _position_sync_snapshot_cache.pop(cache_key, None)
             return None
-        return exch_size, exch_entry
+        return exch_size, exch_entry, inst_map
 
 
 def _set_position_sync_snapshot(
     cache_key: str,
     exch_size: Dict[str, Dict[str, float]],
     exch_entry_price: Dict[str, Dict[str, float]],
+    inst_id_map: Optional[Dict[str, Dict[str, str]]] = None,
 ) -> None:
     ttl = _position_sync_cache_ttl_sec()
     with _position_sync_cache_lock:
@@ -118,7 +141,100 @@ def _set_position_sync_snapshot(
             time.time() + ttl,
             exch_size,
             exch_entry_price,
+            inst_id_map or {},
         )
+
+
+def invalidate_position_sync_snapshot(cache_key: str) -> None:
+    """Drop cached exchange position snapshot (e.g. after a fill)."""
+    with _position_sync_cache_lock:
+        _position_sync_snapshot_cache.pop(str(cache_key or ""), None)
+
+
+def invalidate_position_sync_snapshot_for_exchange(
+    *,
+    user_id: int,
+    exchange_id: str,
+    market_type: str,
+    exchange_config: Dict[str, Any],
+) -> None:
+    invalidate_position_sync_snapshot(
+        _position_sync_cache_key(
+            int(user_id or 1),
+            str(exchange_id or "").strip().lower(),
+            str(market_type or "swap").strip().lower(),
+            exchange_config if isinstance(exchange_config, dict) else {},
+        )
+    )
+
+
+def _persist_strategy_fill(
+    *,
+    strategy_id: int,
+    symbol: str,
+    signal_type: str,
+    filled: float,
+    avg_price: float,
+    exchange_config: Dict[str, Any],
+    market_type: str,
+    order_id: int = 0,
+    fill_source: str = "worker",
+    commission: float = 0.0,
+    commission_ccy: str = "",
+    profit: Optional[float] = None,
+    close_reason: str = "",
+    matched_entry_price: Optional[float] = None,
+    grid_matched_profit: Optional[float] = None,
+    inst_id: str = "",
+) -> Tuple[Optional[float], Optional[float]]:
+    """Apply fill to L3 snapshot and append L2 trade row."""
+    leg = resolve_leg_context(
+        strategy_id=int(strategy_id),
+        symbol=str(symbol or ""),
+        exchange_config=exchange_config,
+        market_type=str(market_type or "swap"),
+        inst_id=str(inst_id or ""),
+        fill_source=str(fill_source or "worker"),
+        pending_order_id=int(order_id or 0),
+    )
+    profit_out, _pos, matched_entry = apply_fill_to_local_position(
+        strategy_id=int(strategy_id),
+        symbol=str(symbol or ""),
+        signal_type=str(signal_type or ""),
+        filled=float(filled or 0.0),
+        avg_price=float(avg_price or 0.0),
+        leg=leg,
+    )
+    if profit is None:
+        profit = profit_out
+    if matched_entry_price is None:
+        matched_entry_price = matched_entry
+    record_trade(
+        strategy_id=int(strategy_id),
+        symbol=str(symbol or ""),
+        trade_type=str(signal_type or ""),
+        price=float(avg_price or 0.0),
+        amount=float(filled or 0.0),
+        commission=float(commission or 0.0),
+        commission_ccy=str(commission_ccy or ""),
+        profit=profit,
+        close_reason=str(close_reason or ""),
+        matched_entry_price=matched_entry_price,
+        grid_matched_profit=grid_matched_profit if grid_matched_profit is not None else profit,
+        leg=leg,
+    )
+    try:
+        from app.services.live_trading.records import _get_user_id_from_strategy
+
+        invalidate_position_sync_snapshot_for_exchange(
+            user_id=_get_user_id_from_strategy(int(strategy_id)),
+            exchange_id=str(exchange_config.get("exchange_id") or "").strip().lower(),
+            market_type=str(market_type or "swap"),
+            exchange_config=exchange_config if isinstance(exchange_config, dict) else {},
+        )
+    except Exception:
+        pass
+    return profit, matched_entry_price
 
 
 def _exchange_sync_backoff_sec() -> float:
@@ -154,6 +270,12 @@ def _is_exchange_rate_limit_error(msg: str) -> bool:
     )
 
 
+def _trade_close_reason_from_payload(payload: Dict[str, Any], signal_type: str) -> str:
+    if is_exit_trade_type(str(signal_type or "")):
+        return str((payload or {}).get("reason") or "").strip()
+    return ""
+
+
 class PendingOrderWorker:
     def __init__(self, poll_interval_sec: float = 1.0, batch_size: int = 50):
         self.poll_interval_sec = float(poll_interval_sec)
@@ -177,6 +299,10 @@ class PendingOrderWorker:
 
     def start(self) -> bool:
         with self._lock:
+            try:
+                ensure_position_ledger_schema()
+            except Exception as e:
+                logger.warning("ensure_position_ledger_schema failed: %s", e)
             if self._thread and self._thread.is_alive():
                 return True
             self._stop_event.clear()
@@ -314,6 +440,17 @@ class PendingOrderWorker:
             try:
                 sc = load_strategy_configs(int(sid))
                 exec_mode = (sc.get("execution_mode") or "").strip().lower()
+                bot_type = str(
+                    sc.get("bot_type")
+                    or (sc.get("trading_config") or {}).get("bot_type")
+                    or ""
+                ).strip().lower()
+                if strategy_uses_fill_ledger(sc):
+                    logger.debug(
+                        "[PositionSync] Strategy %s skipped: fill-ledger strategy (L3)",
+                        sid,
+                    )
+                    continue
                 # 修改：即使signal模式，如果指定了target_strategy_id（策略启动时调用），也要同步
                 # 这样可以清理用户在交易所手动平仓但数据库记录还在的"幽灵持仓"
                 if exec_mode != "live" and not target_strategy_id:
@@ -336,16 +473,7 @@ class PendingOrderWorker:
                 
                 # Get strategy's trading symbol(s) to filter positions
                 # Only sync positions for symbols that this strategy actually trades
-                strategy_symbol = (sc.get("symbol") or "").strip()
-                trading_config = sc.get("trading_config") or {}
-                symbol_list = trading_config.get("symbol_list") or []
-                # Normalize symbol list: convert to set for fast lookup
-                allowed_symbols = set()
-                if strategy_symbol:
-                    allowed_symbols.add(strategy_symbol.upper())
-                for sym in symbol_list:
-                    if sym and isinstance(sym, str):
-                        allowed_symbols.add(sym.strip().upper())
+                allowed_symbols = strategy_allowed_symbols(sc)
 
                 # Lazy import MT5 / IBKR / Alpaca clients here so the elif chain
                 # below can rely on isinstance() checks without paying the import
@@ -378,9 +506,10 @@ class PendingOrderWorker:
                 cached_snap = _get_position_sync_snapshot(cache_key)
                 exch_size: Dict[str, Dict[str, float]] = {}
                 exch_entry_price: Dict[str, Dict[str, float]] = {}
+                exch_inst_id: Dict[str, Dict[str, str]] = {}
 
                 if cached_snap is not None:
-                    exch_size, exch_entry_price = cached_snap
+                    exch_size, exch_entry_price, exch_inst_id = cached_snap
                 else:
                     if _is_exchange_sync_backoff(cache_key):
                         logger.warning(
@@ -479,7 +608,14 @@ class PendingOrderWorker:
                                     continue
                                 # instId: BTC-USDT-SWAP -> BTC/USDT
                                 hb_sym = inst_id.replace("-SWAP", "").replace("-", "/")
-                                side = "long" if pos_side == "long" else ("short" if pos_side == "short" else ("long" if pos > 0 else "short"))
+                                if pos_side == "long":
+                                    side = "long"
+                                elif pos_side == "short":
+                                    side = "short"
+                                elif pos_side == "net":
+                                    side = "long" if pos > 0 else "short"
+                                else:
+                                    side = "long" if pos > 0 else "short"
                                 # IMPORTANT: OKX swap positions `pos` is in contracts, but our system uses base-asset quantity.
                                 # Convert contracts -> base using ctVal when available.
                                 qty_base = abs(float(pos))
@@ -491,7 +627,8 @@ class PendingOrderWorker:
                                 except Exception:
                                     pass
                                 exch_size.setdefault(hb_sym, {"long": 0.0, "short": 0.0})[side] = float(qty_base)
-                            
+                                exch_inst_id.setdefault(hb_sym, {"long": "", "short": ""})[side] = inst_id
+
                                 # Extract entry price from OKX position data
                                 # OKX API returns avgPx (average price) or avgPxEp (average price in equity) for positions
                                 try:
@@ -786,12 +923,57 @@ class PendingOrderWorker:
                                     exch_entry_price.setdefault(sym, {"long": 0.0, "short": 0.0})[side_str] = avg
                         # Continue to reconciliation logic below
 
+                    elif market_type == "spot":
+                        from app.services.live_trading.spot_wallet_snapshot import list_spot_wallet_positions
+
+                        try:
+                            spot_rows = list_spot_wallet_positions(client) or []
+                        except Exception as e:
+                            logger.error(
+                                f"[PositionSync] Strategy {sid} spot wallet sync failed: {e}",
+                                exc_info=True,
+                            )
+                            continue
+                        for row in spot_rows:
+                            if not isinstance(row, dict):
+                                continue
+                            sym = normalize_strategy_symbol(str(row.get("symbol") or "")) or str(
+                                row.get("symbol") or ""
+                            ).strip()
+                            side = str(row.get("side") or "long").strip().lower()
+                            try:
+                                sz = float(row.get("size") or 0.0)
+                            except Exception:
+                                sz = 0.0
+                            if not sym or side not in ("long", "short") or sz <= 1e-12:
+                                continue
+                            exch_size.setdefault(sym, {"long": 0.0, "short": 0.0})[side] = sz
+                            ep = float(row.get("entry_price") or 0.0)
+                            if ep > 0:
+                                exch_entry_price.setdefault(sym, {"long": 0.0, "short": 0.0})[side] = ep
+                            iid = str(row.get("inst_id") or "")
+                            if iid:
+                                exch_inst_id.setdefault(sym, {"long": "", "short": ""})[side] = iid
+
                     else:
-                        # Spot reconciliation is optional; skip for now (keeps self-check low-risk).
                         logger.debug(f"position sync: skip unsupported market/client: sid={sid}, cfg={safe_cfg}, market_type={market_type}, client={type(client)}")
                         continue
 
-                    _set_position_sync_snapshot(cache_key, exch_size, exch_entry_price)
+                    _set_position_sync_snapshot(cache_key, exch_size, exch_entry_price, exch_inst_id)
+                    try:
+                        cred_id = credential_id_from_exchange_config(exchange_config)
+                        legs = account_legs_from_exchange_maps(
+                            exch_size, exch_entry_price, exch_inst_id
+                        )
+                        sync_account_positions(
+                            user_id=int(sync_user_id),
+                            credential_id=cred_id,
+                            exchange_id=str(exchange_id or ""),
+                            market_type=str(market_type or "swap"),
+                            legs=legs,
+                        )
+                    except Exception as l1_err:
+                        logger.warning("[PositionSync] L1 account sync failed key=%s: %s", cache_key, l1_err)
 
                 # [DEBUG] Log all normalized exchange keys for inspection
                 logger.debug(f"[PositionSync] Strategy {sid} Exchange Keys: {list(exch_size.keys())}")
@@ -809,118 +991,33 @@ class PendingOrderWorker:
                 else:
                     logger.info(f"[PositionSync] Strategy {sid} ({safe_cfg.get('exchange_id', 'unknown')}) has NO positions on exchange.")
 
-                # 3) Apply reconciliation to local rows.
-                to_delete_ids: List[int] = []
-                to_update: List[Dict[str, Any]] = []
-                eps = 1e-12
-
-                for r in plist:
-                    rid = int(r.get("id") or 0)
-                    sym = str(r.get("symbol") or "").strip()
-                    side = str(r.get("side") or "").strip().lower()
-                    if not rid or not sym or side not in ("long", "short"):
-                        continue
-                    try:
-                        local_size = float(r.get("size") or 0.0)
-                    except Exception:
-                        local_size = 0.0
-
-                    exch = exch_size.get(sym) or {}
-                    exch_qty = float(exch.get(side) or 0.0)
-
-                    # Lookup entry price
-                    exch_ep_map = exch_entry_price.get(sym) or {}
-                    exch_price = float(exch_ep_map.get(side) or 0.0)
-
-                    try:
-                        local_price = float(r.get("entry_price") or 0.0)
-                    except Exception:
-                        local_price = 0.0
-                    logger.debug(f"[PositionSync] Check ID={rid} {sym} {side}: local_sz={local_size} px={local_price}, exch_sz={exch_qty} px={exch_price}")
-
-                    if exch_qty <= eps:
-                        # Exchange is flat -> delete local position (self-heal).
-                        to_delete_ids.append(rid)
-                    else:
-                        # Update local size if it diverged materially (best-effort), OR if entry_price changed significantly (>0.5% diff)
-                        # or if local_price is 0 (first sync)
-                        price_diff_ratio = 0.0
-                        if local_price > 0:
-                            price_diff_ratio = abs(exch_price - local_price) / local_price
-                        else:
-                            price_diff_ratio = 1.0 if exch_price > 0 else 0.0
-
-                        if (local_size <= 0 or abs(exch_qty - local_size) / max(1.0, local_size) > 0.01) or (price_diff_ratio > 0.005):
-                            logger.info(f"[PositionSync] -> Flagged for UPDATE: {sym} (local_sz={local_size}->{exch_qty}, px={local_price}->{exch_price})")
-                            to_update.append({"id": rid, "size": exch_qty, "entry_price": exch_price})
-
-                # [New Feature] Detect positions that exist on exchange but not in local DB, and insert them.
-                # IMPORTANT: Only insert positions for symbols that this strategy actually trades
-                # This prevents syncing positions from quick trade or other sources
-                to_insert: List[Dict[str, Any]] = []
-                local_symbols_sides = {(str(r.get("symbol") or "").strip(), str(r.get("side") or "").strip().lower()) for r in plist}
-                
-                for _sym, _sides_map in exch_size.items():
-                    # Filter: only sync positions for symbols that this strategy trades
-                    # If strategy has no symbol configured, skip auto-insert to prevent syncing quick trade positions
-                    _sym_upper = _sym.strip().upper()
-                    if allowed_symbols and _sym_upper not in allowed_symbols:
-                        logger.debug(f"[PositionSync] Skipping {_sym}: not in strategy's symbol list (strategy trades: {allowed_symbols})")
-                        continue
-                    elif not allowed_symbols:
-                        # Strategy has no symbol configured - skip to prevent syncing unrelated positions
-                        logger.debug(f"[PositionSync] Skipping {_sym}: strategy has no symbol configured (preventing quick trade position sync)")
-                        continue
-                    
-                    for _side, _qty in _sides_map.items():
-                        if _qty > 1e-12 and (_sym, _side) not in local_symbols_sides:
-                            # Exchange has this position but local DB does not
-                            _ep = exch_entry_price.get(_sym, {}).get(_side, 0.0)
-                            to_insert.append({
-                                "strategy_id": sid,
-                                "symbol": _sym,
-                                "side": _side,
-                                "size": _qty,
-                                "entry_price": _ep
-                            })
-                            logger.info(f"[PositionSync] -> Flagged for INSERT: {_sym} {_side} size={_qty} entry={_ep}")
-
-                if not to_delete_ids and not to_update and not to_insert:
-                    continue
-
-                with get_db_connection() as db:
-                    cur = db.cursor()
-                    for rid in to_delete_ids:
-                        cur.execute("DELETE FROM qd_strategy_positions WHERE id = %s", (int(rid),))
-                    for u in to_update:
-                        cur.execute(
-                            "UPDATE qd_strategy_positions SET size = %s, entry_price = %s, updated_at = NOW() WHERE id = %s", 
-                            (float(u["size"]), float(u["entry_price"]), int(u["id"]))
+                # 3) L3 reconcile: upsert allowed strategy symbols from exchange;
+                # delete legs that are flat. Scoped to strategy_allowed_symbols only.
+                try:
+                    written = apply_exchange_snapshot_to_strategy_ledger(
+                        strategy_id=int(sid),
+                        strategy_config={
+                            "symbol": sc.get("symbol"),
+                            "trading_config": sc.get("trading_config") or {},
+                        },
+                        exch_size=exch_size,
+                        exch_entry_price=exch_entry_price,
+                        exch_inst_id=exch_inst_id,
+                        market_type=str(market_type or "swap"),
+                        exchange_config=exchange_config if isinstance(exchange_config, dict) else {},
+                    )
+                    if written:
+                        logger.debug(
+                            "position sync: upserted %s L3 legs for strategy_id=%s",
+                            written,
+                            sid,
                         )
-                    for ins in to_insert:
-                        # Get user_id from strategy
-                        ins_user_id = 1
-                        try:
-                            cur.execute("SELECT user_id FROM qd_strategies_trading WHERE id = %s", (int(ins["strategy_id"]),))
-                            strategy_row = cur.fetchone()
-                            if strategy_row and strategy_row.get("user_id"):
-                                ins_user_id = int(strategy_row["user_id"])
-                        except Exception:
-                            pass
-                        cur.execute(
-                            """INSERT INTO qd_strategy_positions (user_id, strategy_id, symbol, side, size, entry_price, updated_at)
-                               VALUES (%s, %s, %s, %s, %s, %s, NOW())""",
-                            (ins_user_id, int(ins["strategy_id"]), str(ins["symbol"]), str(ins["side"]), float(ins["size"]), float(ins["entry_price"]))
-                        )
-                    db.commit()
-                    cur.close()
-
-                if to_delete_ids:
-                    logger.debug(f"position sync: removed {len(to_delete_ids)} ghost positions for strategy_id={sid}")
-                if to_update:
-                    logger.debug(f"position sync: updated {len(to_update)} positions for strategy_id={sid}")
-                if to_insert:
-                    logger.debug(f"position sync: inserted {len(to_insert)} new positions for strategy_id={sid}")
+                except Exception as l3_err:
+                    logger.warning(
+                        "position sync: L3 ledger apply failed strategy_id=%s: %s",
+                        sid,
+                        l3_err,
+                    )
             except Exception as e:
                 msg = str(e)
                 if is_fatal_exchange_error(msg):
@@ -1273,6 +1370,8 @@ class PendingOrderWorker:
             _console_print(f"[worker] create_client_failed: strategy_id={strategy_id} pending_id={order_id} err={e}")
             _notify_live_best_effort(status="failed", error=f"create_client_failed:{e}")
             append_strategy_log(strategy_id, "error", f"Exchange client creation failed ({exchange_id}): {e}")
+            if is_fatal_exchange_error(str(e)):
+                auto_stop_live_strategy(int(strategy_id), str(e), source="pending_order_client")
             return
 
         # Check if this is an IBKR client (US stocks)
@@ -1407,6 +1506,23 @@ class PendingOrderWorker:
 
         side, pos_side, reduce_only = _signal_to_side_pos_reduce(signal_type)
 
+        from app.services.live_trading.position_query import query_exchange_position_size
+
+        pre_position_qty = 0.0
+        try:
+            pre_position_qty = float(
+                query_exchange_position_size(
+                    client=client,
+                    symbol=str(symbol),
+                    pos_side=str(pos_side or ""),
+                    market_type=str(market_type or "swap"),
+                    exchange_config=exchange_config if isinstance(exchange_config, dict) else {},
+                )
+                or 0.0
+            )
+        except Exception as e:
+            logger.debug("pre_position_qty snapshot failed pending_id=%s: %s", order_id, e)
+
         # Leverage handling (best-effort):
         # - For OKX swap, leverage must be set via private endpoint; otherwise exchange defaults apply.
         # - For other exchanges, leverage setting is not implemented yet in this local client.
@@ -1428,44 +1544,26 @@ class PendingOrderWorker:
         except Exception as e:
             logger.warning(f"Pre-execution sync failed: {e}")
 
-        # [FEATURE] Auto-correct amount for Close/Reduce signals if we hold less than requested
+        # Collect raw exchange interactions / intermediate states for debugging & persistence.
+        phases: Dict[str, Any] = {"pre_position_qty": pre_position_qty}
+
+        # Close/reduce: cap to DB size; if DB empty, fall back to live exchange position.
         if reduce_only:
             try:
-                with get_db_connection() as db:
-                    cur = db.cursor()
-                    # We need to find the specific position. 
-                    # Symbol stored in DB is normalized (e.g. BTC/USDT). 
-                    # The payload 'symbol' might be 'BTCUSDT' or 'BTC/USDT'.
-                    # We try to match what stored in DB.
-                    # Best effort: try exact match, then normalized.
-                    qry_sym = str(symbol or "").strip().upper()
-                    # Mapping logic similar to _sync:
-                    if qry_sym.endswith("USDT") and "/" not in qry_sym:
-                        qry_sym = f"{qry_sym[:-4]}/USDT"
-                    
-                    cur.execute(
-                        "SELECT size FROM qd_strategy_positions WHERE strategy_id = %s AND symbol = %s AND side = %s",
-                        (strategy_id, qry_sym, pos_side)
-                    )
-                    row = cur.fetchone()
-                    cur.close()
-                    
-                    if row:
-                        held_size = float(row["size"] or 0.0)
-                        if amount > held_size:
-                            logger.warning(f"[RiskControl] Adjusting Close amount from {amount} to {held_size} (Held) for {symbol}")
-                            amount = held_size
-                    else:
-                        # No position found in DB?
-                        # If reduce_only, and no position, maybe it's 0.
-                        logger.warning(f"[RiskControl] Close signal for {symbol} but NO position found in DB. Setting amount=0.")
-                        amount = 0.0
+                amount, close_meta = resolve_reduce_only_quantity(
+                    strategy_id=int(strategy_id),
+                    symbol=str(symbol or ""),
+                    pos_side=str(pos_side or ""),
+                    requested_amount=float(amount or 0.0),
+                    client=client,
+                    market_type=str(market_type or "swap"),
+                    exchange_config=exchange_config,
+                )
+                if close_meta:
+                    phases["close_size_resolve"] = close_meta
             except Exception as e:
-                 logger.error(f"[RiskControl] Failed to check DB position logic: {e}")
-
-
-        # Collect raw exchange interactions / intermediate states for debugging & persistence.
-        phases: Dict[str, Any] = {}
+                logger.error(f"[RiskControl] Failed to resolve close quantity: {e}")
+                phases["close_size_resolve_error"] = str(e)
 
         # Ensure ref price exists (used by maker pricing, fallbacks, and local DB snapshots).
         if ref_price <= 0:
@@ -1520,99 +1618,6 @@ class PendingOrderWorker:
         def _current_avg() -> float:
             return float(total_quote / total_base) if total_base > 0 else 0.0
 
-        # For close/reduce signals, query actual exchange position to avoid insufficient balance due to fees
-        # The exchange position may be smaller than our recorded amount due to trading fees
-        if reduce_only and market_type == "swap":
-            try:
-                actual_pos_size = 0.0
-                if isinstance(client, OkxClient):
-                    inst_id = to_okx_swap_inst_id(str(symbol))
-                    pos_resp = client.get_positions(inst_id=inst_id)
-                    pos_data = (pos_resp.get("data") or []) if isinstance(pos_resp, dict) else []
-                    for pos in pos_data:
-                        if not isinstance(pos, dict):
-                            continue
-                        pos_inst = str(pos.get("instId") or "").strip()
-                        pos_ps = str(pos.get("posSide") or "").strip().lower()
-                        # Match instrument and position side
-                        if pos_inst == inst_id and pos_ps == pos_side:
-                            # OKX pos field is signed for net mode; use abs for simplicity
-                            pos_qty = abs(float(pos.get("pos") or 0.0))
-                            # Convert contracts to base amount using ctVal
-                            ct_val = float(pos.get("ctVal") or 0.0)
-                            if ct_val > 0:
-                                actual_pos_size = pos_qty * ct_val
-                            else:
-                                actual_pos_size = pos_qty
-                            break
-                elif isinstance(client, BinanceFuturesClient):
-                    pos_resp = client.get_positions() or []
-                    pos_list = pos_resp if isinstance(pos_resp, list) else []
-                    # Normalize symbol for matching (remove / or -)
-                    norm_sym = str(symbol or "").replace("/", "").replace("-", "").upper()
-                    for pos in pos_list:
-                        if not isinstance(pos, dict):
-                            continue
-                        pos_sym = str(pos.get("symbol") or "").upper()
-                        if pos_sym != norm_sym:
-                            continue
-                        # Match position side
-                        p_side = str(pos.get("positionSide") or "").strip().lower()
-                        if p_side == pos_side or (p_side == "both" and pos_side in ("long", "short")):
-                            pos_amt = abs(float(pos.get("positionAmt") or 0.0))
-                            if pos_amt > 0:
-                                actual_pos_size = pos_amt
-                                break
-                elif isinstance(client, BybitClient):
-                    pos_resp = client.get_positions(symbol=str(symbol or "")) or {}
-                    pos_list = (pos_resp.get("result") or {}).get("list") or [] if isinstance(pos_resp, dict) else []
-                    want = str(symbol or "").replace("/", "").replace("-", "").upper()
-                    for pos in pos_list:
-                        if not isinstance(pos, dict):
-                            continue
-                        pos_sym = str(pos.get("symbol") or "").strip().upper()
-                        if pos_sym != want:
-                            continue
-                        p_side = str(pos.get("side") or "").strip().lower()
-                        if (p_side == "buy" and pos_side == "long") or (p_side == "sell" and pos_side == "short"):
-                            pos_sz = abs(float(pos.get("size") or 0.0))
-                            if pos_sz > 0:
-                                actual_pos_size = pos_sz
-                                break
-                elif isinstance(client, BitgetMixClient):
-                    product_type = str(exchange_config.get("product_type") or exchange_config.get("productType") or "USDT-FUTURES")
-                    pos_resp = client.get_positions(product_type=product_type) or {}
-                    pos_list = (pos_resp.get("data") or []) if isinstance(pos_resp, dict) else []
-                    for pos in pos_list:
-                        if not isinstance(pos, dict):
-                            continue
-                        pos_sym = str(pos.get("symbol") or "")
-                        if pos_sym != str(symbol or ""):
-                            continue
-                        p_side = str(pos.get("holdSide") or "").strip().lower()
-                        if p_side == pos_side:
-                            pos_sz = abs(float(pos.get("total") or pos.get("available") or 0.0))
-                            if pos_sz > 0:
-                                actual_pos_size = pos_sz
-                                break
-                
-                # If we found actual position and it's smaller than requested, use actual size
-                if actual_pos_size > 0 and actual_pos_size < float(amount or 0.0):
-                    logger.info(
-                        f"Close position adjustment: pending_id={order_id}, strategy_id={strategy_id}, "
-                        f"requested={amount}, actual_pos={actual_pos_size}, using actual"
-                    )
-                    phases["pos_adjustment"] = {
-                        "requested": float(amount or 0.0),
-                        "actual_position": actual_pos_size,
-                        "using": actual_pos_size,
-                    }
-                    amount = actual_pos_size
-            except Exception as e:
-                # Best-effort only; log and continue with original amount
-                logger.warning(f"Failed to query position for close adjustment: pending_id={order_id}, err={e}")
-                phases["pos_query_error"] = str(e)
-
         # Spot close: cap to exchange free base (fees often make DB size > sellable free).
         if reduce_only and market_type == "spot" and side == "sell":
             try:
@@ -1630,18 +1635,100 @@ class PendingOrderWorker:
                 )
                 phases["spot_close_adjust_error"] = str(e)
 
+        spot_quote_amt = 0.0
+        spot_market_buy_uses_quote = False
+        if market_type == "spot":
+            try:
+                from app.services.live_trading.spot_sizing import prepare_spot_live_order_sizes
+
+                amount, spot_quote_amt, spot_market_buy_uses_quote = prepare_spot_live_order_sizes(
+                    client,
+                    symbol=str(symbol),
+                    side=side,
+                    reduce_only=reduce_only,
+                    base_qty=float(amount or 0.0),
+                    ref_price=ref_price,
+                )
+                phases["spot_prepare"] = {
+                    "base_qty": amount,
+                    "quote_amt": spot_quote_amt,
+                    "market_buy_uses_quote": spot_market_buy_uses_quote,
+                }
+            except Exception as e:
+                logger.warning(
+                    "Spot size prepare failed: pending_id=%s, err=%s", order_id, e
+                )
+                phases["spot_prepare_error"] = str(e)
+
         # Decide if we should use limit-first flow.
         use_limit_first = order_mode in ("maker", "limit", "limit_first", "maker_then_market")
 
         remaining = float(amount or 0.0)
-        if remaining <= 0:
+        # Close/reduce: DB may lag right after open or trailing; re-sync + re-query exchange once.
+        if (
+            remaining <= 0
+            and reduce_only
+            and not (spot_market_buy_uses_quote and spot_quote_amt > 0)
+        ):
+            phases["close_size_retry"] = {"trigger": "zero_after_first_resolve"}
+            try:
+                logger.info(
+                    "[CloseRetry] Close qty is 0 for strategy=%s %s %s; re-syncing positions",
+                    strategy_id,
+                    symbol,
+                    signal_type,
+                )
+                self._sync_positions_best_effort(target_strategy_id=strategy_id)
+                amount, retry_meta = resolve_reduce_only_quantity(
+                    strategy_id=int(strategy_id),
+                    symbol=str(symbol or ""),
+                    pos_side=str(pos_side or ""),
+                    requested_amount=float(payload.get("amount") or order_row.get("amount") or 0.0),
+                    client=client,
+                    market_type=str(market_type or "swap"),
+                    exchange_config=exchange_config,
+                )
+                if retry_meta:
+                    phases["close_size_retry"].update(retry_meta)
+                remaining = float(amount or 0.0)
+                if remaining > 0:
+                    logger.info(
+                        "[CloseRetry] Resolved close qty=%s for strategy=%s %s %s",
+                        remaining,
+                        strategy_id,
+                        symbol,
+                        signal_type,
+                    )
+            except Exception as e:
+                logger.warning(
+                    "[CloseRetry] Re-sync/resolve failed: pending_id=%s strategy=%s err=%s",
+                    order_id,
+                    strategy_id,
+                    e,
+                )
+                phases["close_size_retry"]["error"] = str(e)
+
+        if remaining <= 0 and not (spot_market_buy_uses_quote and spot_quote_amt > 0):
             self._mark_failed(order_id=order_id, error="invalid_amount")
             _notify_live_best_effort(status="failed", error="invalid_amount", amount_hint=amount)
-            append_strategy_log(strategy_id, "error", f"Order rejected: invalid amount ({amount}) for {symbol} {signal_type}")
+            if reduce_only:
+                append_strategy_log(
+                    strategy_id,
+                    "error",
+                    f"Order rejected: invalid amount ({amount}) for {symbol} {signal_type} "
+                    f"(no position after sync; check exchange/DB alignment)",
+                )
+            else:
+                append_strategy_log(
+                    strategy_id,
+                    "error",
+                    f"Order rejected: invalid amount ({amount}) for {symbol} {signal_type}",
+                )
             return
 
         # Phase 1: limit (hang order)
         limit_order_id = ""
+        limit_client_oid = ""
         if use_limit_first:
             try:
                 # price adjustment to reduce immediate taker fills (best-effort)
@@ -1721,6 +1808,7 @@ class PendingOrderWorker:
                         reduce_only=reduce_only,
                         post_only=(order_mode in ("maker", "maker_then_market", "limit_first", "limit")),
                         client_order_id=limit_client_oid,
+                        hold_side=pos_side or ("long" if side == "buy" else "short"),
                     )
                 elif isinstance(client, BitgetSpotClient):
                     res1 = client.place_limit_order(
@@ -2088,11 +2176,15 @@ class PendingOrderWorker:
                         margin_mode=margin_mode,
                         reduce_only=reduce_only,
                         client_order_id=market_client_oid,
+                        hold_side=pos_side or ("long" if side == "buy" else "short"),
                     )
                 elif isinstance(client, BitgetSpotClient):
-                    # For Bitget spot market BUY, convert base->quote using ref_price (hummingbot style).
-                    mkt_size = remaining
-                    if side == "buy" and ref_price > 0:
+                    mkt_size = (
+                        spot_quote_amt
+                        if (side == "buy" and spot_market_buy_uses_quote and spot_quote_amt > 0)
+                        else remaining
+                    )
+                    if side == "buy" and mkt_size <= 0 and ref_price > 0:
                         mkt_size = remaining * ref_price
                     res2 = client.place_market_order(
                         symbol=str(symbol),
@@ -2132,23 +2224,22 @@ class PendingOrderWorker:
                         client_order_id=market_client_oid,
                     )
                 elif isinstance(client, KucoinSpotClient):
-                    # KuCoin market BUY expects quote funds; convert base->quote using ref_price.
-                    if side == "buy" and ref_price > 0:
-                        res2 = client.place_market_order(
-                            symbol=str(symbol),
-                            side=side,
-                            size=float(remaining) * float(ref_price),
-                            quote_size=True,
-                            client_order_id=market_client_oid,
-                        )
+                    if side == "buy" and spot_market_buy_uses_quote and spot_quote_amt > 0:
+                        kucoin_mkt = spot_quote_amt
+                        kucoin_quote = True
+                    elif side == "buy" and ref_price > 0:
+                        kucoin_mkt = float(remaining) * float(ref_price)
+                        kucoin_quote = True
                     else:
-                        res2 = client.place_market_order(
-                            symbol=str(symbol),
-                            side=side,
-                            size=remaining,
-                            quote_size=False,
-                            client_order_id=market_client_oid,
-                        )
+                        kucoin_mkt = remaining
+                        kucoin_quote = False
+                    res2 = client.place_market_order(
+                        symbol=str(symbol),
+                        side=side,
+                        size=kucoin_mkt,
+                        quote_size=kucoin_quote,
+                        client_order_id=market_client_oid,
+                    )
                 elif isinstance(client, KucoinFuturesClient):
                     try:
                         if market_type == "swap":
@@ -2163,8 +2254,12 @@ class PendingOrderWorker:
                         client_order_id=market_client_oid,
                     )
                 elif isinstance(client, GateSpotClient):
-                    mkt_size = remaining
-                    if side == "buy" and ref_price > 0:
+                    mkt_size = (
+                        spot_quote_amt
+                        if (side == "buy" and spot_market_buy_uses_quote and spot_quote_amt > 0)
+                        else remaining
+                    )
+                    if side == "buy" and mkt_size <= 0 and ref_price > 0:
                         mkt_size = remaining * ref_price
                     res2 = client.place_market_order(
                         symbol=str(symbol),
@@ -2339,12 +2434,44 @@ class PendingOrderWorker:
                 append_strategy_log(strategy_id, "error", f"Unexpected order error ({exchange_id} {symbol} {signal_type}): {e}")
                 return
 
-        # Build final result (best-effort)
+        # Build final result (best-effort) — live path never fabricates fill qty from request amount.
         filled_final = float(total_base or 0.0)
         avg_final = float(_current_avg() or 0.0)
-        if filled_final <= 0 and ref_price > 0:
-            filled_final = float(amount or 0.0)
-            avg_final = float(ref_price or 0.0)
+
+        ex_oid_for_recovery = str(market_order_id or limit_order_id or "")
+        coid_for_recovery = str(
+            market_client_oid if market_order_id else (limit_client_oid if limit_order_id else "")
+        )
+        if filled_final <= 0 and ex_oid_for_recovery:
+            from app.services.live_trading.fill_recovery import try_recover_zero_fill
+
+            rec_filled, rec_avg, rec_src = try_recover_zero_fill(
+                client,
+                symbol=str(symbol),
+                market_type=str(market_type or "swap"),
+                exchange_config=exchange_config if isinstance(exchange_config, dict) else {},
+                exchange_order_id=ex_oid_for_recovery,
+                client_order_id=coid_for_recovery,
+                requested_qty=float(amount or 0.0),
+                signal_type=str(signal_type or ""),
+                pos_side=str(pos_side or ""),
+                pre_position_qty=float(pre_position_qty or 0.0),
+                ref_price=float(ref_price or 0.0),
+            )
+            if rec_filled > 0:
+                filled_final = rec_filled
+                avg_final = rec_avg if rec_avg > 0 else float(ref_price or 0.0)
+                phases["fill_recovery"] = {
+                    "source": rec_src,
+                    "filled": rec_filled,
+                    "avg_price": avg_final,
+                    "exchange_order_id": ex_oid_for_recovery,
+                }
+                append_strategy_log(
+                    strategy_id,
+                    "info",
+                    f"Fill recovered ({rec_src}): {signal_type} {symbol} qty={rec_filled:.6f} @ ~{avg_final:.4f}",
+                )
 
         res = type("Tmp", (), {"exchange_id": str(exchange_config.get("exchange_id") or ""), "exchange_order_id": str(market_order_id or limit_order_id), "raw": phases, "filled": filled_final, "avg_price": avg_final})()
 
@@ -2376,27 +2503,20 @@ class PendingOrderWorker:
                     f"live record begin: pending_id={order_id} strategy_id={strategy_id} symbol={symbol} "
                     f"signal={signal_type} filled={filled} avg_price={avg_price} fee={total_fee} fee_ccy={fee_ccy}"
                 )
-                profit, _pos = apply_fill_to_local_position(
-                    strategy_id=strategy_id,
+                _close_reason = _trade_close_reason_from_payload(payload, str(signal_type))
+                profit, matched_entry = _persist_strategy_fill(
+                    strategy_id=int(strategy_id),
                     symbol=str(symbol),
                     signal_type=str(signal_type),
-                    filled=filled,
-                    avg_price=avg_price,
-                )
-                # ``profit`` = trade P&L from position math (gross).
-                # ``commission`` = fee synced from the exchange fill (see
-                # ``total_fee`` above). Net realised P&L is always
-                # ``profit - commission`` at read/aggregate time — do not
-                # pre-subtract here or dashboards double-count the fee.
-                record_trade(
-                    strategy_id=strategy_id,
-                    symbol=str(symbol),
-                    trade_type=str(signal_type),
-                    price=avg_price,
-                    amount=filled,
+                    filled=float(filled),
+                    avg_price=float(avg_price),
+                    exchange_config=exchange_config,
+                    market_type=str(market_type or "swap"),
+                    order_id=int(order_id),
+                    fill_source="worker",
                     commission=float(total_fee or 0.0),
                     commission_ccy=str(fee_ccy or "").strip().upper(),
-                    profit=profit,
+                    close_reason=_close_reason,
                 )
                 logger.info(f"live record done: pending_id={order_id} strategy_id={strategy_id} symbol={symbol} signal={signal_type}")
                 _profit_str = f", profit={profit:.4f}" if profit is not None else ""
@@ -2536,22 +2656,17 @@ class PendingOrderWorker:
                         f"IBKR record begin: pending_id={order_id} strategy_id={strategy_id} symbol={symbol} "
                         f"signal={signal_type} filled={filled} avg_price={avg_price}"
                     )
-                    profit, _pos = apply_fill_to_local_position(
-                        strategy_id=strategy_id,
+                    profit, matched_entry = _persist_strategy_fill(
+                        strategy_id=int(strategy_id),
                         symbol=str(symbol),
                         signal_type=str(signal_type),
-                        filled=filled,
-                        avg_price=avg_price,
-                    )
-                    record_trade(
-                        strategy_id=strategy_id,
-                        symbol=str(symbol),
-                        trade_type=str(signal_type),
-                        price=avg_price,
-                        amount=filled,
-                        commission=0.0,  # IBKR commission is complex, skip for now
-                        commission_ccy="USD",
-                        profit=profit,
+                        filled=float(filled),
+                        avg_price=float(avg_price),
+                        exchange_config=exchange_config,
+                        market_type=str(market_type or "USStock"),
+                        order_id=int(order_id),
+                        fill_source="worker_ibkr",
+                        close_reason=_trade_close_reason_from_payload(payload, str(signal_type)),
                     )
                     logger.info(f"IBKR record done: pending_id={order_id} strategy_id={strategy_id} symbol={symbol}")
                     _pstr = f", profit={profit:.4f}" if profit is not None else ""
@@ -2678,23 +2793,19 @@ class PendingOrderWorker:
 
             try:
                 if filled > 0 and avg_price > 0:
-                    profit, _pos = apply_fill_to_local_position(
-                        strategy_id=strategy_id,
+                    profit, matched_entry = _persist_strategy_fill(
+                        strategy_id=int(strategy_id),
                         symbol=str(symbol),
                         signal_type=str(signal_type),
-                        filled=filled,
-                        avg_price=avg_price,
+                        filled=float(filled),
+                        avg_price=float(avg_price),
+                        exchange_config=exchange_config,
+                        market_type=str(market_type_for_client or "USStock"),
+                        order_id=int(order_id),
+                        fill_source="worker_alpaca",
+                        close_reason=_trade_close_reason_from_payload(payload, str(signal_type)),
                     )
-                    record_trade(
-                        strategy_id=strategy_id,
-                        symbol=str(symbol),
-                        trade_type=str(signal_type),
-                        price=avg_price,
-                        amount=filled,
-                        commission=0.0,  # Alpaca commissions are zero on stocks; crypto has fees in raw
-                        commission_ccy="USD",
-                        profit=profit,
-                    )
+                    logger.info(f"Alpaca record done: pending_id={order_id} strategy_id={strategy_id} symbol={symbol}")
                     _pstr = f", profit={profit:.4f}" if profit is not None else ""
                     append_strategy_log(
                         strategy_id, "trade",
@@ -2822,22 +2933,22 @@ class PendingOrderWorker:
                         f"MT5 record begin: pending_id={order_id} strategy_id={strategy_id} symbol={symbol} "
                         f"signal={signal_type} filled={filled} avg_price={avg_price}"
                     )
-                    profit, _pos = apply_fill_to_local_position(
-                        strategy_id=strategy_id,
+                    mt5_market = str(
+                        payload.get("market_type")
+                        or exchange_config.get("market_type")
+                        or "forex"
+                    ).strip()
+                    profit, matched_entry = _persist_strategy_fill(
+                        strategy_id=int(strategy_id),
                         symbol=str(symbol),
                         signal_type=str(signal_type),
-                        filled=filled,
-                        avg_price=avg_price,
-                    )
-                    record_trade(
-                        strategy_id=strategy_id,
-                        symbol=str(symbol),
-                        trade_type=str(signal_type),
-                        price=avg_price,
-                        amount=filled,
-                        commission=0.0,  # MT5 commission is complex, skip for now
-                        commission_ccy="USD",
-                        profit=profit,
+                        filled=float(filled),
+                        avg_price=float(avg_price),
+                        exchange_config=exchange_config,
+                        market_type=mt5_market,
+                        order_id=int(order_id),
+                        fill_source="worker_mt5",
+                        close_reason=_trade_close_reason_from_payload(payload, str(signal_type)),
                     )
                     logger.info(f"MT5 record done: pending_id={order_id} strategy_id={strategy_id} symbol={symbol}")
                     _pstr = f", profit={profit:.4f}" if profit is not None else ""
