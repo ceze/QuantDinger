@@ -25,6 +25,41 @@ TOP_CRYPTO_SYMBOLS = [
 ]
 
 
+def _enrich_change_7d_from_coingecko(result: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Supplement change_7d for CCXT results via a single CoinGecko request."""
+    if not result:
+        return result
+    try:
+        # Build symbol→index map for fast lookup
+        sym_map = {}
+        for i, coin in enumerate(result):
+            s = (coin.get("symbol") or "").upper()
+            if s:
+                sym_map[s] = i
+
+        url = "https://api.coingecko.com/api/v3/coins/markets"
+        params = {
+            "vs_currency": "usd",
+            "order": "market_cap_desc",
+            "per_page": 100,
+            "page": 1,
+            "sparkline": False,
+            "price_change_percentage": "7d",
+        }
+        resp = requests.get(url, params=params, timeout=8)
+        resp.raise_for_status()
+        for coin in resp.json():
+            sym = (coin.get("symbol") or "").upper()
+            idx = sym_map.get(sym)
+            if idx is not None:
+                val = safe_float(coin.get("price_change_percentage_7d_in_currency"))
+                if val is not None:
+                    result[idx]["change_7d"] = val
+    except Exception as e:
+        logger.debug("CoinGecko change_7d enrichment failed: %s", e)
+    return result
+
+
 def fetch_crypto_prices_ccxt() -> List[Dict[str, Any]]:
     """Fetch crypto prices using CCXT (system's existing data source)."""
     try:
@@ -56,7 +91,7 @@ def fetch_crypto_prices_ccxt() -> List[Dict[str, Any]]:
                         "name": base,
                         "price": safe_float(ticker.get("last") or ticker.get("close")),
                         "change_24h": safe_float(ticker.get("percentage", 0)),
-                        "change_7d": 0,
+                        "change_7d": 0,  # enriched by CoinGecko below
                         "market_cap": 0,
                         "volume_24h": safe_float(ticker.get("quoteVolume", 0)),
                         "image": "",
@@ -66,6 +101,7 @@ def fetch_crypto_prices_ccxt() -> List[Dict[str, Any]]:
                 logger.debug("Failed to fetch %s: %s", symbol, e)
                 continue
 
+        result = _enrich_change_7d_from_coingecko(result)
         return result
     except Exception as e:
         logger.error("Failed to fetch crypto prices via CCXT: %s", e)
@@ -125,18 +161,15 @@ def fetch_crypto_prices_yfinance() -> List[Dict[str, Any]]:
 
 
 def fetch_crypto_prices(*, fast: bool = False) -> List[Dict[str, Any]]:
-    """Fetch top crypto prices — try CCXT → yfinance → CoinGecko."""
-    if not fast:
-        result = fetch_crypto_prices_ccxt()
-        if result and len(result) >= 50:
-            logger.info("Fetched %d crypto prices via CCXT", len(result))
-            return result
+    """Fetch top crypto prices — try CoinGecko → CCXT fallback."""
 
-    # result = fetch_crypto_prices_yfinance()
-    # if result and len(result) >= 50:
-    #     logger.info("Fetched %d crypto prices via yfinance", len(result))
-    #     return result
+    # if not fast:
+    #     result = fetch_crypto_prices_ccxt()
+    #     if result and len(result) >= 50:
+    #         logger.info("Fetched %d crypto prices via CCXT (fallback)", len(result))
+    #         return result
 
+    # CoinGecko 首选：返回完整的 change_24h + change_7d + market_cap
     try:
         url = "https://api.coingecko.com/api/v3/coins/markets"
         params = {
@@ -167,7 +200,13 @@ def fetch_crypto_prices(*, fast: bool = False) -> List[Dict[str, Any]]:
         logger.info("Fetched %d crypto prices via CoinGecko", len(result))
         return result
     except Exception as e:
-        logger.error("Failed to fetch crypto prices from CoinGecko: %s", e)
+        logger.warning("CoinGecko failed: %s, falling back to CCXT", e)
+
+    # CCXT 回退：缺少 change_7d，尝试 CoinGecko 补充
+    result = fetch_crypto_prices_ccxt()
+    if result and len(result) >= 5:
+        logger.info("Fetched %d crypto prices via CCXT (fallback)", len(result))
+        return result
 
     logger.warning("All crypto data sources failed, returning placeholder data")
     return [
