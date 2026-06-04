@@ -635,10 +635,31 @@ def get_history():
     GET /api/fast-analysis/history?market=Crypto&symbol=BTC/USDT&days=7&limit=10
     """
     try:
+        memory_id = request.args.get('memory_id', '').strip()
         market = request.args.get('market', '').strip()
         symbol = request.args.get('symbol', '').strip()
         days = int(request.args.get('days', 7))
         limit = min(int(request.args.get('limit', 10)), 50)
+        
+        memory = get_analysis_memory()
+        
+        # 如果传入 memory_id，直接返回对应记录
+        if memory_id:
+            history = memory.get_by_id(memory_id)
+            if not history:
+                return jsonify({
+                    'code': 0,
+                    'msg': f'memory_id {memory_id} not found',
+                    'data': None
+                }), 404
+            return jsonify({
+                'code': 1,
+                'msg': 'success',
+                'data': {
+                    'items': [history],
+                    'total': 1
+                }
+            })
         
         if not market or not symbol:
             return jsonify({
@@ -647,7 +668,6 @@ def get_history():
                 'data': None
             }), 400
         
-        memory = get_analysis_memory()
         history = memory.get_recent(market, symbol, days, limit)
         
         return jsonify({
@@ -797,7 +817,8 @@ def submit_feedback():
 
 
 @fast_analysis_blp.route('/performance', methods=['GET'])
-@login_required
+# @login_required  # Disabled: allow anonymous access
+@cross_origin()  # Allow CORS for this route
 def get_performance():
     """
     Get AI analysis performance statistics.

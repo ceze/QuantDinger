@@ -232,7 +232,61 @@ class AnalysisMemory:
         except Exception as e:
             logger.error(f"Failed to store analysis memory: {e}", exc_info=True)
             return None
-    
+
+    def get_by_id(self, memory_id) -> Optional[Dict]:
+        """
+        Get a single analysis memory record by its ID.
+        
+        Args:
+            memory_id: The record ID (str or int)
+        
+        Returns:
+            Dict with the record data, or None if not found
+        """
+        try:
+            mid = int(memory_id)
+        except (TypeError, ValueError):
+            return None
+        try:
+            with get_db_connection() as db:
+                cur = db.cursor()
+                cur.execute("""
+                    SELECT 
+                        id, market, symbol, decision, confidence, price_at_analysis,
+                        summary, reasons, scores, indicators_snapshot, raw_result,
+                        created_at, validated_at, was_correct, actual_return_pct,
+                        task_status, task_error, updated_at
+                    FROM qd_analysis_memory
+                    WHERE id = %s
+                """, (mid,))
+                row = cur.fetchone()
+                cur.close()
+                if not row:
+                    return None
+                result = {
+                    "id": row['id'],
+                    "market": row.get('market', ''),
+                    "symbol": row.get('symbol', ''),
+                    "decision": row['decision'],
+                    "confidence": row['confidence'],
+                    "price": float(row['price_at_analysis']) if row['price_at_analysis'] else None,
+                    "summary": row['summary'],
+                    "reasons": _safe_json_parse(row['reasons'], []),
+                    "scores": _safe_json_parse(row['scores'], {}),
+                    "indicators": _safe_json_parse(row.get('indicators_snapshot'), {}),
+                    "full_result": _safe_json_parse(row.get('raw_result'), None),
+                    "status": row.get('task_status') or 'completed',
+                    "error_message": row.get('task_error') or '',
+                    "created_at": row['created_at'].isoformat() if row['created_at'] else None,
+                    "updated_at": row['updated_at'].isoformat() if row.get('updated_at') else None,
+                    "was_correct": row['was_correct'],
+                    "actual_return_pct": float(row['actual_return_pct']) if row['actual_return_pct'] else None,
+                }
+                return result
+        except Exception as e:
+            logger.error(f"Failed to get memory by id {memory_id}: {e}")
+            return None
+
     def get_recent(self, market: str, symbol: str, days: int = 7, limit: int = 5) -> List[Dict]:
         """
         Get recent analysis history for a symbol.
