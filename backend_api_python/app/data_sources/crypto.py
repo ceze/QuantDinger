@@ -363,6 +363,15 @@ class CryptoDataSource(BaseDataSource):
                 f"Error: {str(e)[:100]}"
             )
 
+        # CCXT failed — try KTX native as fallback
+        try:
+            ktx_ticker = self._get_ticker_ktx(symbol)
+            if ktx_ticker and ktx_ticker.get('last', 0) > 0:
+                logger.info(f"Ticker fallback to KTX native succeeded for {symbol}")
+                return ktx_ticker
+        except Exception as ktx_e:
+            logger.debug(f"KTX ticker fallback also failed for {symbol}: {ktx_e}")
+
         return {"last": 0, "symbol": symbol}
 
     def _get_ticker_ktx(self, symbol: str) -> Dict[str, Any]:
@@ -568,6 +577,16 @@ class CryptoDataSource(BaseDataSource):
 
             if not ohlcv:
                 logger.warning(f"CCXT returned no K-lines: {symbol_pair}")
+
+                # CCXT failed — try KTX native as fallback
+                try:
+                    ktx_klines = self._get_kline_ktx(symbol, timeframe, limit, before_time, after_time)
+                    if ktx_klines:
+                        logger.info(f"K-line fallback to KTX native succeeded for {symbol} {timeframe}")
+                        return ktx_klines
+                except Exception as ktx_e:
+                    logger.debug(f"KTX kline fallback also failed for {symbol}: {ktx_e}")
+
                 return []
 
             if resample_bucket > 1:

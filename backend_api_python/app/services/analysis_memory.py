@@ -515,8 +515,8 @@ class AnalysisMemory:
                         updated_at = NOW()
                     WHERE id = %s
                 """, (
-                    result.get("decision"),
-                    result.get("confidence"),
+                    result.get("decision") or "HOLD",
+                    result.get("confidence") or 0,
                     result.get("market_data", {}).get("current_price"),
                     result.get("summary"),
                     json.dumps(result.get("reasons", [])),
