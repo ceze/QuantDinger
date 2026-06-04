@@ -52,7 +52,7 @@ def _enrich_change_7d_from_coingecko(result: List[Dict[str, Any]]) -> List[Dict[
             sym = (coin.get("symbol") or "").upper()
             idx = sym_map.get(sym)
             if idx is not None:
-                val = safe_float(coin.get("price_change_percentage_7d_in_currency"))
+                val = round(safe_float(coin.get("price_change_percentage_7d_in_currency")), 3)
                 if val is not None:
                     result[idx]["change_7d"] = val
     except Exception as e:
@@ -190,10 +190,10 @@ def fetch_crypto_prices(*, fast: bool = False) -> List[Dict[str, Any]]:
                 "symbol": coin.get("symbol", "").upper(),
                 "name": coin.get("name", ""),
                 "price": safe_float(coin.get("current_price")),
-                "change_24h": safe_float(coin.get("price_change_percentage_24h")),
-                "change_7d": safe_float(coin.get("price_change_percentage_7d_in_currency")),
-                "market_cap": safe_float(coin.get("market_cap")),
-                "volume_24h": safe_float(coin.get("total_volume")),
+                "change_24h": round(safe_float(coin.get("price_change_percentage_24h")), 3),
+                "change_7d": round(safe_float(coin.get("price_change_percentage_7d_in_currency")), 3),
+                "market_cap": round(safe_float(coin.get("market_cap")), 3),
+                "volume_24h": round(safe_float(coin.get("total_volume")), 3),
                 "image": coin.get("image", ""),
                 "category": "crypto",
             })

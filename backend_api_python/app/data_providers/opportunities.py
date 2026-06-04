@@ -257,23 +257,23 @@ def analyze_opportunities_crypto(opportunities: list):
 
         if change > 15:
             signal, strength = "overbought", "strong"
-            reason = f"24h涨幅{change:.1f}%，7日涨幅{change_7d:.1f}%，短期超买风险"
-            reason_en = f"24h +{change:.1f}%, 7d +{change_7d:.1f}%, overbought risk"
+            reason = f"24h涨幅{change:.1f}%，7日涨幅{change_7d:.1f}%，短期超买风险."
+            reason_en = f"24h +{change:.1f}%, 7d +{change_7d:.1f}%, overbought risk."
             impact = "bearish"
         elif change > 5:
             signal, strength = "bullish_momentum", "medium"
-            reason = f"24h涨幅{change:.1f}%，上涨动能强劲"
-            reason_en = f"24h +{change:.1f}%, strong bullish momentum"
+            reason = f"24h涨幅{change:.1f}%，上涨动能强劲!"
+            reason_en = f"24h +{change:.1f}%, strong bullish momentum!"
             impact = "bullish"
         elif change < -15:
             signal, strength = "oversold", "strong"
-            reason = f"24h跌幅{abs(change):.1f}%，可能超卖反弹"
-            reason_en = f"24h -{abs(change):.1f}%, possible oversold bounce"
+            reason = f"24h跌幅{abs(change):.1f}%，可能超卖反弹."
+            reason_en = f"24h -{abs(change):.1f}%, possible oversold bounce."
             impact = "bullish"
         elif change < -5:
             signal, strength = "bearish_momentum", "medium"
-            reason = f"24h跌幅{abs(change):.1f}%，下跌趋势明显"
-            reason_en = f"24h -{abs(change):.1f}%, clear bearish trend"
+            reason = f"24h跌幅{abs(change):.1f}%，下跌趋势明显."
+            reason_en = f"24h -{abs(change):.1f}%, clear bearish trend."
             impact = "bearish"
 
         if signal:
