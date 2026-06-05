@@ -18,6 +18,7 @@ from flask_cors import cross_origin
 logger = get_logger(__name__)
 
 fast_analysis_blp = Blueprint('fast_analysis', __name__)
+analysis_blp = Blueprint('analysis', __name__)
 
 # L1 Result cache (in-process dict, fastest): share analysis result among concurrent requests
 # Key: "market:symbol:timeframe:language" -> {"result": ..., "timestamp": ...}
@@ -255,6 +256,7 @@ def _run_async_analysis_task(task_memory_id: int, market: str, symbol: str, lang
 
 
 @fast_analysis_blp.route('/analyze', methods=['POST'])
+@analysis_blp.route('/apply', methods=['POST'])
 # @login_required  # Disabled: allow anonymous access
 @cross_origin()  # Allow CORS for this route
 def analyze():
@@ -650,6 +652,7 @@ def analyze_legacy():
 
 
 @fast_analysis_blp.route('/history', methods=['GET'])
+@analysis_blp.route('/history', methods=['GET'])
 # @login_required  # Disabled: allow anonymous access
 @cross_origin()  # Allow CORS for this route
 def get_history():
@@ -713,6 +716,7 @@ def get_history():
 
 
 @fast_analysis_blp.route('/history/all', methods=['GET'])
+@analysis_blp.route('/history/all',methods=['GET'])
 # @login_required  # Disabled: allow anonymous access
 @cross_origin()  # Allow CORS for this route
 def get_all_history():
@@ -841,6 +845,7 @@ def submit_feedback():
 
 
 @fast_analysis_blp.route('/performance', methods=['GET'])
+@analysis_blp.route('/performance',methods=['GET'])
 # @login_required  # Disabled: allow anonymous access
 @cross_origin()  # Allow CORS for this route
 def get_performance():
