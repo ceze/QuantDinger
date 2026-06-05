@@ -19,10 +19,6 @@ logger = get_logger(__name__)
 
 fast_analysis_blp = Blueprint('fast_analysis', __name__)
 
-# In-memory in-flight guard to avoid duplicate analysis charges caused by rapid repeated clicks.
-_analysis_inflight_lock = threading.Lock()
-_analysis_inflight = {}  # key -> expire_ts
-
 # L1 Result cache (in-process dict, fastest): share analysis result among concurrent requests
 # Key: "market:symbol:timeframe:language" -> {"result": ..., "timestamp": ...}
 _analysis_result_cache = {}
@@ -141,8 +137,72 @@ def _build_cache_key(market: str, symbol: str, timeframe: str, language: str) ->
     return f"{(market or '').strip().upper()}:{(symbol or '').strip().upper()}:{(timeframe or '1D').strip().upper()}:{language}"
 
 
+def _db_get_recent_result(market: str, symbol: str, timeframe: str, max_age_minutes: int = 5) -> dict | None:
+    """Check DB for a recently completed or pending analysis.
+
+    This is the ultimate safety net against duplicate task creation — even when
+    L1/L2 caches miss (multi-worker gunicorn, Redis unavailable), the DB
+    always has the truth.
+
+    Returns a dict with at least ``{"task_id", "task_status"}`` and, for
+    completed tasks, the full result payload.
+    """
+    try:
+        from app.utils.db import get_db_connection
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute("""
+                SELECT id, task_status, decision, confidence, price_at_analysis,
+                       summary, reasons, scores,
+                       created_at, timeframe, raw_result
+                FROM qd_analysis_memory
+                WHERE market = %s AND symbol = %s AND (timeframe = %s OR timeframe IS NULL)
+                  AND task_status IN ('pending', 'processing', 'completed')
+                  AND created_at > NOW() - (%s || ' minutes')::interval
+                ORDER BY created_at DESC
+                LIMIT 1
+            """, (market.strip(), symbol.strip(), (timeframe or '1D').strip(), int(max_age_minutes)))
+            row = cur.fetchone()
+            if not row:
+                return None
+
+            task_id = row['id']
+            task_status = row['task_status']
+
+            # Pending/processing task — return task_id so the caller can return "submitted"
+            if task_status in ('pending', 'processing'):
+                return {
+                    'task_id': task_id,
+                    'memory_id': task_id,
+                    'task_status': 'pending',
+                }
+
+            # Completed task — return full result
+            raw = row['raw_result']
+            if raw and isinstance(raw, dict) and raw.get('decision'):
+                raw['_db_cached'] = True
+                raw['_memory_id'] = task_id
+                raw['task_status'] = 'completed'
+                return raw
+            # Fallback: reconstruct from columns
+            return {
+                'decision': row['decision'],
+                'confidence': row['confidence'],
+                'price_at_analysis': float(row['price_at_analysis']) if row['price_at_analysis'] else None,
+                'summary': row['summary'],
+                'reasons': row['reasons'],
+                'scores': row['scores'],
+                'memory_id': task_id,
+                'task_status': 'completed',
+                '_db_cached': True,
+            }
+    except Exception as e:
+        logger.warning(f"DB recent-result check failed: {e}", exc_info=True)
+        return None
+
+
 def _run_async_analysis_task(task_memory_id: int, market: str, symbol: str, language: str,
-                             model: str, timeframe: str, user_id: int, inflight_key: str,
+                             model: str, timeframe: str, user_id: int,
                              credits_charged: int = 0):
     """
     Background worker: execute analysis and update pending history record.
@@ -192,33 +252,6 @@ def _run_async_analysis_task(task_memory_id: int, market: str, symbol: str, lang
             logger.error(f"Async task marked as failed: memory_id={task_memory_id}")
         except Exception:
             pass
-    finally:
-        try:
-            _release_inflight(inflight_key)
-        except Exception:
-            pass
-
-
-def _build_inflight_key(user_id: int, market: str, symbol: str, timeframe: str) -> str:
-    return f"{int(user_id)}|{str(market or '').strip().upper()}|{str(symbol or '').strip().upper()}|{str(timeframe or '').strip().upper()}"
-
-
-def _acquire_inflight(key: str, ttl_sec: int = 90) -> bool:
-    now = time.time()
-    with _analysis_inflight_lock:
-        # Cleanup stale entries
-        stale = [k for k, exp in _analysis_inflight.items() if float(exp) <= now]
-        for k in stale[:1024]:
-            _analysis_inflight.pop(k, None)
-        if key in _analysis_inflight and float(_analysis_inflight.get(key) or 0) > now:
-            return False
-        _analysis_inflight[key] = now + int(ttl_sec)
-        return True
-
-
-def _release_inflight(key: str):
-    with _analysis_inflight_lock:
-        _analysis_inflight.pop(key, None)
 
 
 @fast_analysis_blp.route('/analyze', methods=['POST'])
@@ -237,7 +270,7 @@ def analyze():
         async_submit (optional): Submit as background task
     """
     try:
-        data = request.get_json() or {}
+        data = request.get_json(silent=True) or dict(request.form)
         
         market = (data.get('market') or '').strip()
         symbol = (data.get('symbol') or '').strip()
@@ -277,37 +310,50 @@ def analyze():
                     '_cached': True
                 }
             })
-        logger.info(f"Cache miss (L1+L2) for {cache_key}, performing fresh analysis")
-            
-        # Build inflight key (per-user to prevent duplicate charges)
-        inflight_key = _build_inflight_key(user_id, market, symbol, timeframe)
-        if not _acquire_inflight(inflight_key, ttl_sec=90):
-            # Another request from same user is in progress
-            # Wait a bit and try to get the cached result
-            time.sleep(0.5)
-            cached_result, cache_source = _cache_get(cache_key)
-            if cached_result is not None:
-                logger.info(f"Duplicate request from same user, returning cached result ({cache_source}) for {cache_key}")
+        logger.info(f"Cache miss (L1+L2) for {cache_key}, checking DB for recent result")
+
+        # L3: Database fallback — find a recently completed analysis for the same
+        # market/symbol/timeframe.  This guards against duplicate task creation
+        # when L1 (process-local) and L2 (Redis) caches miss due to multi-worker
+        # gunicorn deployments or transient Redis failures.
+        db_result = _db_get_recent_result(market, symbol, timeframe, max_age_minutes=5)
+        if db_result is not None:
+            task_status = db_result.get('task_status', 'completed')
+            db_task_id = db_result.get('task_id') or db_result.get('_memory_id')
+
+            if task_status == 'pending':
+                # A pending task exists — return "submitted" instead of creating a duplicate
+                logger.info(f"DB pending task found for {cache_key}, returning submitted (task_id={db_task_id})")
                 return jsonify({
                     'code': 1,
-                    'msg': 'success (cached)',
+                    'msg': 'submitted',
                     'data': {
-                        **cached_result,
+                        'task_id': db_task_id,
+                        'memory_id': db_task_id,
+                        'status': 'processing',
                         'market': market,
                         'symbol': symbol,
                         'timeframe': timeframe,
                         'credits_charged': 0,
                         'remaining_credits': None,
-                        '_cached': True
                     }
                 })
-            
-            return jsonify({
-                'code': 0,
-                'msg': 'Analysis already in progress for this symbol/timeframe. Please wait.',
-                'data': {'in_progress': True}
-            }), 429
 
+            # Completed task — return cached result
+            logger.info(f"DB cache hit for {cache_key}, returning recent result (memory_id={db_task_id})")
+            return jsonify({
+                'code': 1,
+                'msg': 'success (cached)',
+                'data': {
+                    **db_result,
+                    'market': market,
+                    'symbol': symbol,
+                    'timeframe': timeframe,
+                    'credits_charged': 0,
+                    'remaining_credits': None,
+                }
+            })
+            
         # Billing / credits (best-effort) - Anonymous users (88888) skip billing
         credits_charged = 0
         remaining_credits = None
@@ -389,12 +435,10 @@ def analyze():
 
             t = threading.Thread(
                 target=_run_async_analysis_task,
-                args=(int(pending_id), market, symbol, language, model, timeframe, int(user_id), inflight_key, int(credits_charged or 0)),
+                args=(int(pending_id), market, symbol, language, model, timeframe, int(user_id), int(credits_charged or 0)),
                 daemon=True
             )
             t.start()
-            # worker owns inflight release
-            inflight_key = None
 
             return jsonify({
                 'code': 1,
@@ -476,12 +520,6 @@ def analyze():
             'msg': str(e),
             'data': None
         }), 500
-    finally:
-        try:
-            if 'inflight_key' in locals() and inflight_key:
-                _release_inflight(inflight_key)
-        except Exception:
-            pass
 
 
 @fast_analysis_blp.route('/analyze-legacy', methods=['POST'])
@@ -498,7 +536,7 @@ def analyze_legacy():
         Result in multi-agent format for frontend compatibility.
     """
     try:
-        data = request.get_json() or {}
+        data = request.get_json(silent=True) or dict(request.form)
         
         market = (data.get('market') or '').strip()
         symbol = (data.get('symbol') or '').strip()
@@ -517,14 +555,6 @@ def analyze_legacy():
         user_id = getattr(g, 'user_id', None)
         if not user_id:
             return jsonify({'code': 0, 'msg': 'Unauthorized', 'data': None}), 401
-
-        inflight_key = _build_inflight_key(user_id, market, symbol, timeframe)
-        if not _acquire_inflight(inflight_key, ttl_sec=90):
-            return jsonify({
-                'code': 0,
-                'msg': 'Analysis already in progress for this symbol/timeframe. Please wait.',
-                'data': {'in_progress': True}
-            }), 429
 
         credits_charged = 0
         remaining_credits = None
@@ -617,12 +647,6 @@ def analyze_legacy():
             'msg': str(e),
             'data': None
         }), 500
-    finally:
-        try:
-            if 'inflight_key' in locals() and inflight_key:
-                _release_inflight(inflight_key)
-        except Exception:
-            pass
 
 
 @fast_analysis_blp.route('/history', methods=['GET'])
@@ -778,7 +802,7 @@ def submit_feedback():
         feedback (required): helpful, not_helpful, accurate, or inaccurate
     """
     try:
-        data = request.get_json() or {}
+        data = request.get_json(silent=True) or dict(request.form)
         
         memory_id = int(data.get('memory_id', 0))
         feedback = (data.get('feedback') or '').strip()

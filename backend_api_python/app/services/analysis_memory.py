@@ -55,6 +55,7 @@ class AnalysisMemory:
                         user_id INT,
                         market VARCHAR(50) NOT NULL,
                         symbol VARCHAR(50) NOT NULL,
+                        timeframe VARCHAR(10),
                         decision VARCHAR(10) NOT NULL,
                         confidence INT DEFAULT 50,
                         price_at_analysis DECIMAL(24, 8),
@@ -148,6 +149,13 @@ class AnalysisMemory:
                         ) THEN
                             ALTER TABLE qd_analysis_memory ADD COLUMN updated_at TIMESTAMP DEFAULT NOW();
                         END IF;
+
+                        IF NOT EXISTS (
+                            SELECT 1 FROM information_schema.columns
+                            WHERE table_name = 'qd_analysis_memory' AND column_name = 'timeframe'
+                        ) THEN
+                            ALTER TABLE qd_analysis_memory ADD COLUMN timeframe VARCHAR(10);
+                        END IF;
                     END $$;
                 """)
                 
@@ -190,6 +198,7 @@ class AnalysisMemory:
                 # 准备数据
                 market = analysis_result.get("market")
                 symbol = analysis_result.get("symbol")
+                timeframe = analysis_result.get("timeframe") or "1D"
                 decision = analysis_result.get("decision")
                 confidence = analysis_result.get("confidence")
                 price = analysis_result.get("market_data", {}).get("current_price")
@@ -207,15 +216,15 @@ class AnalysisMemory:
                 
                 cur.execute("""
                     INSERT INTO qd_analysis_memory (
-                        user_id, market, symbol, decision, confidence,
+                        user_id, market, symbol, timeframe, decision, confidence,
                         price_at_analysis, summary, reasons, scores, indicators_snapshot, raw_result,
                         consensus_score, consensus_abs, agreement_ratio, quality_multiplier,
                         task_status, task_error, updated_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                               %s, %s, %s, %s, %s, %s, NOW())
                     RETURNING id
                 """, (
-                    user_id, market, symbol, decision, confidence,
+                    user_id, market, symbol, timeframe, decision, confidence,
                     price, summary, reasons, scores, indicators, raw,
                     consensus_score, consensus_abs, agreement_ratio, quality_multiplier,
                     "completed", "",
@@ -464,21 +473,21 @@ class AnalysisMemory:
                     "language": language,
                     "model": model,
                     "timeframe": timeframe,
-                    "task_status": "processing",
+                    "task_status": "pending",
                 })
                 cur.execute("""
                     INSERT INTO qd_analysis_memory (
-                        user_id, market, symbol, decision, confidence,
+                        user_id, market, symbol, timeframe, decision, confidence,
                         summary, reasons, scores, indicators_snapshot, raw_result,
                         task_status, task_error, updated_at, created_at
-                    ) VALUES (%s, %s, %s, %s, %s,
+                    ) VALUES (%s, %s, %s, %s, %s, %s,
                               %s, %s, %s, %s, %s,
                               %s, %s, NOW(), NOW())
                     RETURNING id
                 """, (
-                    user_id, market, symbol, "HOLD", 0,
+                    user_id, market, symbol, timeframe, "HOLD", 0,
                     summary, reasons, scores, indicators, raw,
-                    "processing", "",
+                    "pending", "",
                 ))
                 # PostgresCursor.execute() 会在 INSERT 时提前 fetchone() 消耗 RETURNING 结果，
                 # 所以这里不要再 cur.fetchone()，直接取 lastrowid。

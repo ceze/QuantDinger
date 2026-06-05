@@ -959,6 +959,7 @@ CREATE TABLE IF NOT EXISTS qd_analysis_memory (
     user_id INT,                                -- User who created this analysis (for filtering)
     market VARCHAR(50) NOT NULL,
     symbol VARCHAR(50) NOT NULL,
+    timeframe VARCHAR(10),
     decision VARCHAR(10) NOT NULL,
     confidence INT DEFAULT 50,
     price_at_analysis DECIMAL(24, 8),
@@ -995,6 +996,18 @@ BEGIN
         ALTER TABLE qd_analysis_memory ADD COLUMN user_id INT;
         CREATE INDEX IF NOT EXISTS idx_analysis_memory_user ON qd_analysis_memory(user_id);
         RAISE NOTICE 'Added user_id column to qd_analysis_memory';
+    END IF;
+END $$;
+
+-- Migration: Add timeframe column to existing qd_analysis_memory table
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'qd_analysis_memory' AND column_name = 'timeframe'
+    ) THEN
+        ALTER TABLE qd_analysis_memory ADD COLUMN timeframe VARCHAR(10);
+        RAISE NOTICE 'Added timeframe column to qd_analysis_memory';
     END IF;
 END $$;
 

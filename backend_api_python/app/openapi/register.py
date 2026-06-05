@@ -68,7 +68,7 @@ def register_human_blueprints(api: Api) -> None:
     from app.routes.ibkr import ibkr_blp
     from app.routes.alpaca import alpaca_blp
     from app.routes.mt5 import mt5_blp
-    from app.routes.global_market import global_market_blp
+    from app.routes.global_market import global_market_blp, opportunities_blp
     from app.routes.community import community_blp
     from app.routes.fast_analysis import fast_analysis_blp
     from app.routes.billing import billing_blp
@@ -94,6 +94,7 @@ def register_human_blueprints(api: Api) -> None:
         (alpaca_blp, "/api/alpaca"),
         (mt5_blp, "/api/mt5"),
         (global_market_blp, "/api/global-market"),
+        (opportunities_blp, "/api"),  # short alias: /api/opportunities
         (community_blp, "/api/community"),
         (fast_analysis_blp, "/api/fast-analysis"),
         (billing_blp, "/api/billing"),

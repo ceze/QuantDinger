@@ -149,6 +149,26 @@ class CacheManager:
         except Exception as e:
             logger.error(f"Cache delete failed: {e}")
     
+    def set_if_not_exists(self, key: str, value: Any, ttl: int = 300) -> bool:
+        """SETNX — only set if key does not exist. Returns True if set, False if key already existed."""
+        try:
+            if self._use_redis:
+                # Redis SETNX + expiry (atomic via pipeline)
+                pipe = self._client.pipeline()
+                pipe.setnx(key, json.dumps(value))
+                pipe.expire(key, ttl)
+                results = pipe.execute()
+                return bool(results[0])  # SETNX result: 1=ok, 0=already exists
+            else:
+                # MemoryCache fallback: check then set (not atomic, but fine for single-process)
+                if self._client.get(key) is not None:
+                    return False
+                self._client.setex(key, ttl, json.dumps(value))
+                return True
+        except Exception as e:
+            logger.error(f"Cache SETNX failed: {e}")
+            return False
+    
     @property
     def is_redis(self) -> bool:
         return self._use_redis

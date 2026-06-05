@@ -67,6 +67,7 @@ from app.data_providers.opportunities import (
 logger = get_logger(__name__)
 
 global_market_blp = Blueprint("global_market", __name__)
+opportunities_blp = Blueprint("opportunities", __name__)  # short alias: /api/opportunities & /api/signals
 
 
 # ============ API Endpoints ============
@@ -304,6 +305,7 @@ def _compute_trading_opportunities():
 
 
 @global_market_blp.route("/opportunities", methods=["GET"])
+@opportunities_blp.route("/opportunities", methods=["GET"])
 #@login_required    #  disable login required
 @cross_origin() # Allow CORS for this route
 def trading_opportunities():
@@ -329,6 +331,13 @@ def trading_opportunities():
     except Exception as e:
         logger.error("trading_opportunities failed: %s", e, exc_info=True)
         return jsonify({"code": 0, "msg": str(e), "data": None}), 500
+
+
+# Short alias: /api/signals -> same handler
+@opportunities_blp.route("/signals", methods=["GET"])
+@cross_origin()
+def trading_signal():
+    return trading_opportunities()
 
 
 @global_market_blp.route("/refresh", methods=["POST"])
