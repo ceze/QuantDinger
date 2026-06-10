@@ -1823,14 +1823,14 @@ IMPORTANT:
                     logger.info(f"BUY decision conflicts with indicators but major news/macro event allows override: {', '.join(conflicts)}")
                     analysis["confidence"] = max(confidence - 15, 50)
                     original_summary = analysis.get("summary", "")
-                    analysis["summary"] = f"{original_summary} [注意：技术指标显示{', '.join(conflicts)}，但重大事件可能改变趋势]"
+                    analysis["summary"] = f"{original_summary}"# [注意：技术指标显示{', '.join(conflicts)}，但重大事件可能改变趋势]"
                 else:
                     # 没有重大事件，强制改为HOLD
                     logger.warning(f"BUY decision conflicts with indicators and no major event: {', '.join(conflicts)}. Forcing to HOLD")
                     analysis["decision"] = "HOLD"
                     analysis["confidence"] = max(confidence - 20, 40)
                     original_summary = analysis.get("summary", "")
-                    analysis["summary"] = f"{original_summary} [注意：技术指标显示{', '.join(conflicts)}，建议观望]"
+                    analysis["summary"] = f"{original_summary}" #[注意：技术指标显示{', '.join(conflicts)}，建议观望]"
         
         # 检查SELL决策是否与技术指标矛盾（放宽限制，因为SELL是有效的做空机会）
         elif decision == "SELL":
@@ -1850,14 +1850,14 @@ IMPORTANT:
                     logger.info(f"SELL decision conflicts with strong bullish indicators but major news/macro event allows override: {', '.join(conflicts)}")
                     analysis["confidence"] = max(confidence - 15, 50)
                     original_summary = analysis.get("summary", "")
-                    analysis["summary"] = f"{original_summary} [注意：技术指标显示{', '.join(conflicts)}，但重大事件可能改变趋势]"
+                    analysis["summary"] = f"{original_summary}"# [注意：技术指标显示{', '.join(conflicts)}，但重大事件可能改变趋势]"
                 else:
                     # 只有在非常强烈的看涨信号时才改为HOLD
                     logger.warning(f"SELL decision conflicts with very strong bullish indicators: {', '.join(conflicts)}. Forcing to HOLD")
                     analysis["decision"] = "HOLD"
                     analysis["confidence"] = max(confidence - 20, 40)
                     original_summary = analysis.get("summary", "")
-                    analysis["summary"] = f"{original_summary} [注意：技术指标显示{', '.join(conflicts)}，建议观望]"
+                    analysis["summary"] = f"{original_summary}"# [注意：技术指标显示{', '.join(conflicts)}，建议观望]"
         
         return analysis
     
