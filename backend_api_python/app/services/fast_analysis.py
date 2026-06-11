@@ -209,6 +209,7 @@ class FastAnalysisService:
         include_macro: bool = True,
         include_news: bool = True,
         timeout: int = 45,
+        language: str = 'zh-CN',
     ) -> Dict[str, Any]:
         """
         使用统一的数据采集器收集市场数据
@@ -226,6 +227,7 @@ class FastAnalysisService:
             include_macro=include_macro,
             include_news=include_news,
             timeout=timeout,  # 增加超时时间，确保数据收集完成
+            language=language,
         )
     
     def _calculate_indicators(self, kline_data: List[Dict]) -> Dict[str, Any]:
@@ -978,6 +980,7 @@ IMPORTANT:
                 primary_tf,
                 include_macro=True,
                 include_news=True,
+                language=language,
             )
 
             # Collect extra timeframes for objective consensus (technical-only for cost)
@@ -1024,6 +1027,7 @@ IMPORTANT:
                         include_macro=False,
                         include_news=False,
                         timeout=25,
+                        language=language,
                     )
 
                 current_price_tf = _extract_current_price(d_tf) or 0.0
@@ -1056,6 +1060,7 @@ IMPORTANT:
                         include_macro=False,
                         include_news=False,
                         timeout=25,
+                        language=language,
                     )
                     cp_1w = _extract_current_price(d_1w) or 0.0
                     obj_1w = self._calculate_objective_score(d_1w, cp_1w)
@@ -1079,6 +1084,7 @@ IMPORTANT:
                         include_macro=False,
                         include_news=False,
                         timeout=18,
+                        language=language,
                     )
                     cp_1h = _extract_current_price(d_1h) or 0.0
                     obj_1h = self._calculate_objective_score(d_1h, cp_1h)
