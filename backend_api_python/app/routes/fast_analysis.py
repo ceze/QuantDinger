@@ -138,15 +138,12 @@ def _build_cache_key(market: str, symbol: str, timeframe: str, language: str) ->
     return f"{(market or '').strip().upper()}:{(symbol or '').strip().upper()}:{(timeframe or '1D').strip().upper()}:{language}"
 
 
-def _db_get_recent_result(market: str, symbol: str, timeframe: str, max_age_minutes: int = 5) -> dict | None:
+def _db_get_recent_result(market: str, symbol: str, timeframe: str, max_age_minutes: int = 5, language: str = None) -> dict | None:
     """Check DB for a recently completed or pending analysis.
 
     This is the ultimate safety net against duplicate task creation — even when
     L1/L2 caches miss (multi-worker gunicorn, Redis unavailable), the DB
     always has the truth.
-
-    Returns a dict with at least ``{"task_id", "task_status"}`` and, for
-    completed tasks, the full result payload.
     """
     try:
         from app.utils.db import get_db_connection
@@ -158,11 +155,13 @@ def _db_get_recent_result(market: str, symbol: str, timeframe: str, max_age_minu
                        created_at, timeframe, raw_result
                 FROM qd_analysis_memory
                 WHERE market = %s AND symbol = %s AND (timeframe = %s OR timeframe IS NULL)
+                  AND (language = %s OR language IS NULL)
                   AND task_status IN ('pending', 'processing', 'completed')
                   AND created_at > NOW() - (%s || ' minutes')::interval
                 ORDER BY created_at DESC
                 LIMIT 1
-            """, (market.strip(), symbol.strip(), (timeframe or '1D').strip(), int(max_age_minutes)))
+            """, (market.strip(), symbol.strip(), (timeframe or '1D').strip(),
+                   (language or 'en-US').strip(), int(max_age_minutes)))
             row = cur.fetchone()
             if not row:
                 return None
@@ -318,7 +317,7 @@ def analyze():
         # market/symbol/timeframe.  This guards against duplicate task creation
         # when L1 (process-local) and L2 (Redis) caches miss due to multi-worker
         # gunicorn deployments or transient Redis failures.
-        db_result = _db_get_recent_result(market, symbol, timeframe, max_age_minutes=5)
+        db_result = _db_get_recent_result(market, symbol, timeframe, max_age_minutes=5, language=language)
         if db_result is not None:
             task_status = db_result.get('task_status', 'completed')
             db_task_id = db_result.get('task_id') or db_result.get('_memory_id')

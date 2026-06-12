@@ -1603,7 +1603,6 @@ class MarketDataCollector:
         language: str = 'zh-CN',
     ) -> str:
         is_zh = str(language or "").lower().startswith("zh")
-        logger.info(f"_build_crypto_factor_summary: language={language}, is_zh={is_zh}")
         parts: List[str] = []
         if open_interest_change_24h is not None:
             if is_zh:
