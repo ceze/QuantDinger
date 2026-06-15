@@ -159,29 +159,35 @@ signals — those shapes will fail validation in `_simulate_trading`.
 | `call_indicator(...)` | callable | Invoke another saved indicator from this script |
 | `SMA, EMA, RSI, MACD, BOLL, ATR, CROSSOVER, CROSSUNDER` | callables | Built-in technical helpers (see `app/services/backtest.py::_get_indicator_functions`) |
 
-**Required output** — the script must add **either** of these to `df`:
+**Required output** — new scripts must add four-way execution columns to `df`:
 
 | Style | Required columns | When to use |
 |-------|------------------|-------------|
-| 2-way (recommended) | `df['buy']`, `df['sell']` (boolean Series) | Most strategies — simple long-only or `trade_direction='both'` |
-| 4-way (advanced) | `df['open_long']`, `df['close_long']`, `df['open_short']`, `df['close_short']` (boolean Series) | When you need explicit control over each leg |
+| 4-way (required) | `df['open_long']`, `df['close_long']`, `df['open_short']`, `df['close_short']` (boolean Series) | All generated indicators and strategy backtests |
 
 **`trade_direction='both'` mapping (must match backtest):**
 
 | Column | Meaning at execution |
 |--------|----------------------|
-| `buy=True` | `open_long`; close short first if short |
-| `sell=True` | `open_short`; close long first if long |
+| `open_long=True` | open long; close short first if short |
+| `open_short=True` | open short; close long first if long |
+| `close_long=True` | close long only |
+| `close_short=True` | close short only |
 
-Do **not** assume `buy` is an independent `close_short` signal. Merging short tp/sl into `buy` means flip-long under `both`. See `docs/STRATEGY_DEV_GUIDE.md` §3.3.1 and §11.7 (avoid duplicate indicator exits + `trailingEnabled`).
+Do not generate legacy `df['buy']` / `df['sell']` for new code. `output['signals']`
+is chart-only and cannot place orders.
 
 Minimal working SMA crossover:
 
 ```python
 fast = SMA(close, 10)
 slow = SMA(close, 30)
-df['buy']  = CROSSOVER(fast, slow).fillna(False).astype(bool)
-df['sell'] = CROSSUNDER(fast, slow).fillna(False).astype(bool)
+open_long = CROSSOVER(fast, slow).fillna(False).astype(bool)
+open_short = CROSSUNDER(fast, slow).fillna(False).astype(bool)
+df['open_long'] = open_long
+df['close_short'] = open_long
+df['open_short'] = open_short
+df['close_long'] = open_short
 ```
 
 Trend-pullback with RSI filter (parameterized):
@@ -195,11 +201,15 @@ ema_fast = EMA(close, params['fast_len'])
 ema_slow = EMA(close, params['slow_len'])
 rsi = RSI(close, 14)
 
-raw_buy  = (ema_fast > ema_slow) & (rsi >= params['rsi_floor'])
-raw_sell = (ema_fast < ema_slow)
+raw_open_long = (ema_fast > ema_slow) & (rsi >= params['rsi_floor'])
+raw_open_short = ema_fast < ema_slow
 
-df['buy']  = (raw_buy.fillna(False)  & (~raw_buy.shift(1).fillna(False))).astype(bool)
-df['sell'] = (raw_sell.fillna(False) & (~raw_sell.shift(1).fillna(False))).astype(bool)
+open_long = (raw_open_long.fillna(False) & (~raw_open_long.shift(1).fillna(False))).astype(bool)
+open_short = (raw_open_short.fillna(False) & (~raw_open_short.shift(1).fillna(False))).astype(bool)
+df['open_long'] = open_long
+df['close_short'] = open_long
+df['open_short'] = open_short
+df['close_long'] = open_short
 ```
 
 See `docs/STRATEGY_DEV_GUIDE.md` for the full indicator-authoring guide,

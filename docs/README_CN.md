@@ -438,11 +438,22 @@ docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 - 用户名：`quantdinger`
 - 密码：`123456`（来自 `env.example`；也可在首次登录前于 `.env` 中设置 `ADMIN_USER` / `ADMIN_PASSWORD`）
 
+如果 `ADMIN_PASSWORD` 不是 `123456`，系统会认为默认管理员已安全初始化，不再弹出首次改密提醒；如果旧数据库里仍保存着 `123456`，后端启动时会把首个管理员密码同步为当前 `.env` 的非默认值。
+
 请在 `backend_api_python/.env` 中把 **`FRONTEND_URL`** 设为用户实际访问的完整地址（含 `https://` 反代场景），以免影响跳转、部分跨域相关逻辑与生成链接。
 
 ### 6）可选：打开 AI 能力
 
 AI 分析、自然语言生成代码等需至少配置一个 LLM 供应商。打开 `backend_api_python/env.example` 中的 **AI / LLM** 小节，将对应变量复制到你的 `.env`（例如 `LLM_PROVIDER` + `OPENROUTER_API_KEY`）。修改后需**重启 backend 容器**。
+
+AtlasCloud 也已作为 OpenAI-compatible 供应商接入。参考官方 [AtlasCloud LLM API 文档](https://www.atlascloud.ai/docs/models/llm) 和 [API Key 指南](https://www.atlascloud.ai/docs/api-keys)，然后配置：
+
+```env
+LLM_PROVIDER=atlascloud
+ATLASCLOUD_API_KEY=your_api_key
+ATLASCLOUD_MODEL=deepseek-v3
+ATLASCLOUD_BASE_URL=https://api.atlascloud.ai/v1
+```
 
 现货全仓平仓若因手续费导致「可卖数量略小于持仓」，可在管理后台 **设置 → 实盘交易（Live Trading）** 调整 `SPOT_CLOSE_SAFETY_RATIO`（平仓安全系数，默认 `0.998`）与 `SPOT_OPEN_QUOTE_BUFFER`（开仓占用 USDT 比例，默认 `0.995`）；也可直接写入 `backend_api_python/.env`。保存设置后会热加载，无需重建镜像。
 
@@ -507,11 +518,26 @@ df = df.copy()
 sma_short = df["close"].rolling(sma_short_period).mean()
 sma_long = df["close"].rolling(sma_long_period).mean()
 
-buy = (sma_short > sma_long) & (sma_short.shift(1) <= sma_long.shift(1))
-sell = (sma_short < sma_long) & (sma_short.shift(1) >= sma_long.shift(1))
+def edge(signal):
+    signal = signal.fillna(False).astype(bool)
+    return signal & ~signal.shift(1).fillna(False)
 
-df["buy"] = buy.fillna(False).astype(bool)
-df["sell"] = sell.fillna(False).astype(bool)
+open_long = (sma_short > sma_long) & (sma_short.shift(1) <= sma_long.shift(1))
+open_short = (sma_short < sma_long) & (sma_short.shift(1) >= sma_long.shift(1))
+
+df["open_long"] = edge(open_long)
+df["close_long"] = edge(open_short)
+df["open_short"] = edge(open_short)
+df["close_short"] = edge(open_long)
+
+output = {
+    "name": my_indicator_name,
+    "plots": [
+        {"name": "SMA Short", "data": sma_short.fillna(0).tolist(), "color": "#FF9800", "overlay": True},
+        {"name": "SMA Long", "data": sma_long.fillna(0).tolist(), "color": "#3F51B5", "overlay": True},
+    ],
+    "signals": [],
+}
 ```
 
 完整示例见：
@@ -597,7 +623,7 @@ QuantDinger/
 |--------|------|
 | 认证 | `SECRET_KEY`、`ADMIN_USER`、`ADMIN_PASSWORD` |
 | 数据库 | `DATABASE_URL` |
-| LLM / AI | `LLM_PROVIDER`、`OPENROUTER_API_KEY`、`OPENAI_API_KEY` |
+| LLM / AI | `LLM_PROVIDER`、`OPENROUTER_API_KEY`、`OPENAI_API_KEY`、`ATLASCLOUD_API_KEY` |
 | OAuth | `GOOGLE_CLIENT_ID`、`GITHUB_CLIENT_ID` |
 | 安全 | `TURNSTILE_SITE_KEY`、`ENABLE_REGISTRATION` |
 | 计费 | `BILLING_ENABLED`、`BILLING_COST_AI_ANALYSIS` |

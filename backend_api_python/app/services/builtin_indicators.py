@@ -16,13 +16,22 @@ logger = get_logger(__name__)
 
 # Used for idempotency on registration. Keep in sync with _builtin_specs()[0]["name"].
 _BUILTIN_PACK_ANCHOR_NAME = "[Sample] SuperTrend Trend-Following"
+_FOUR_WAY_COLUMNS = ("open_long", "close_long", "open_short", "close_short")
+_LEGACY_BUILTIN_SAMPLE_NAMES = (
+    _BUILTIN_PACK_ANCHOR_NAME,
+    "[示例] 布林带触及",
+    "[示例] MACD 柱穿零轴",
+    "[示例] 双均线策略",
+    "[示例] RSI 超买超卖",
+    "Dual Moving Average Strategy",
+)
 
 
 # QuantDinger Indicator IDE contract (the sandbox injects df / pd / np / params):
 #   * top of file declares my_indicator_name / my_indicator_description
 #   * df = df.copy()  -> work on a private copy
-#   * execution: four-way open_long/close_long/open_short/close_short (preferred)
-#     or legacy df['buy'] / df['sell'] — see SIGNAL_EXECUTION_STANDARD_CN.md
+#   * execution: four-way open_long/close_long/open_short/close_short
+#   * output['signals'] is chart-only and never drives orders by itself
 #   * output dict contains plots / signals; every data list MUST have length == len(df)
 #   * # @strategy ...  default risk controls; can be overridden in the backtest panel
 #   * # @param ... range=a:b:s  auto-detected by the structured parameter tuner
@@ -56,6 +65,8 @@ my_indicator_description = (
 
 # ===== Default risk controls (overridable in the backtest panel) =====
 # Unit: 0–1 ratio (0.04 = 4% underlying price move; 0.001 = 0.1%; entryPct 1 = 100% capital)
+# close_* below are structural reverse exits on SuperTrend flips. If you add touch-based
+# TP/SL exits to close_*, switch the header to `exit_owner: indicator`.
 # @strategy stopLossPct 0.04
 # @strategy takeProfitPct 0.10
 # @strategy entryPct 1
@@ -252,3 +263,84 @@ def seed_builtin_indicators_for_new_user(db: Any, user_id: int) -> int:
             cur.close()
         except Exception:
             pass
+
+
+def _code_has_four_way_columns(code: str) -> bool:
+    raw = code or ""
+    return all(
+        f"df['{col}']" in raw or f'df["{col}"]' in raw
+        for col in _FOUR_WAY_COLUMNS
+    )
+
+
+def upgrade_builtin_indicator_samples() -> int:
+    """
+    Upgrade persisted official samples to the current four-way execution contract.
+
+    Older built-in samples could draw chart markers with output['signals'] but did
+    not define executable df columns, so backtest/live correctly rejected them.
+    This intentionally updates only known official sample names, and only when
+    their code is still missing open_long/close_long/open_short/close_short.
+    """
+    from app.utils.db import get_db_connection
+
+    specs = _builtin_specs()
+    if not specs:
+        return 0
+
+    target = specs[0]
+    placeholders = ",".join(["?"] * len(_LEGACY_BUILTIN_SAMPLE_NAMES))
+    now = int(time.time())
+    updated = 0
+
+    with get_db_connection() as db:
+        cur = db.cursor()
+        try:
+            cur.execute(
+                f"""
+                SELECT id, name, code
+                FROM qd_indicator_codes
+                WHERE (is_buy IS NULL OR is_buy = 0)
+                  AND (publish_to_community IS NULL OR publish_to_community = 0)
+                  AND name IN ({placeholders})
+                """,
+                tuple(_LEGACY_BUILTIN_SAMPLE_NAMES),
+            )
+            rows = cur.fetchall() or []
+            for row in rows:
+                row_id = row.get("id") if isinstance(row, dict) else row[0]
+                code = row.get("code") if isinstance(row, dict) else row[2]
+                if _code_has_four_way_columns(code or ""):
+                    continue
+                cur.execute(
+                    """
+                    UPDATE qd_indicator_codes
+                    SET name = ?, code = ?, description = ?,
+                        updatetime = ?, updated_at = NOW()
+                    WHERE id = ?
+                    """,
+                    (
+                        target["name"],
+                        target["code"],
+                        target["description"],
+                        now,
+                        row_id,
+                    ),
+                )
+                updated += int(cur.rowcount or 0)
+            db.commit()
+            if updated:
+                logger.info("Upgraded %s builtin indicator sample(s) to four-way contract", updated)
+            return updated
+        except Exception as e:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            logger.warning("upgrade_builtin_indicator_samples failed: %s", e)
+            return 0
+        finally:
+            try:
+                cur.close()
+            except Exception:
+                pass

@@ -24,6 +24,69 @@ def test_litellm_env_mapping(monkeypatch):
     assert cfg["litellm"]["base_url"] == "https://litellm.example/v1"
 
 
+def test_atlascloud_env_mapping(monkeypatch):
+    monkeypatch.setenv("ATLASCLOUD_API_KEY", "atlas-key")
+    monkeypatch.setenv("ATLASCLOUD_MODEL", "deepseek-v3")
+    monkeypatch.setenv("ATLASCLOUD_BASE_URL", "https://api.atlascloud.ai/v1")
+    _reset_config_cache()
+
+    cfg = load_addon_config()
+
+    assert cfg["atlascloud"]["api_key"] == "atlas-key"
+    assert cfg["atlascloud"]["model"] == "deepseek-v3"
+    assert cfg["atlascloud"]["base_url"] == "https://api.atlascloud.ai/v1"
+
+
+def test_atlascloud_provider_defaults_and_model_prefix(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "atlascloud")
+    monkeypatch.setenv("ATLASCLOUD_MODEL", "deepseek-v3")
+    _reset_config_cache()
+
+    service = LLMService()
+
+    assert service.provider == LLMProvider.ATLASCLOUD
+    assert service.get_default_model() == "deepseek-v3"
+    assert service.get_base_url() == "https://api.atlascloud.ai/v1"
+    assert (
+        service._normalize_model_for_provider("atlascloud/deepseek-v3", LLMProvider.ATLASCLOUD)
+        == "deepseek-v3"
+    )
+    assert service._detect_provider_from_model("atlascloud/deepseek-v3") == LLMProvider.ATLASCLOUD
+
+
+def test_atlascloud_openai_compatible_call_skips_response_format(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {"choices": [{"message": {"content": "{\"ok\": true}"}}]}
+
+    def fake_post(url, headers, json, timeout):
+        captured.update({"url": url, "headers": headers, "json": json, "timeout": timeout})
+        return FakeResponse()
+
+    monkeypatch.setattr("app.services.llm.requests.post", fake_post)
+    service = LLMService(provider="atlascloud")
+
+    out = service._call_openai_compatible(
+        [{"role": "user", "content": "hello"}],
+        "deepseek-v3",
+        0.7,
+        "atlas-key",
+        "https://api.atlascloud.ai/v1",
+        30,
+        use_json_mode=True,
+    )
+
+    assert out == "{\"ok\": true}"
+    assert captured["url"] == "https://api.atlascloud.ai/v1/chat/completions"
+    assert captured["headers"]["Authorization"] == "Bearer atlas-key"
+    assert captured["json"]["model"] == "deepseek-v3"
+    assert "response_format" not in captured["json"]
+
+
 def test_litellm_keeps_provider_prefixed_model(monkeypatch):
     monkeypatch.setenv("LLM_PROVIDER", "litellm")
     monkeypatch.setenv("LITELLM_MODEL", "anthropic/claude-sonnet-4-20250514")

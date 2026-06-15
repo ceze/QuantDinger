@@ -8,6 +8,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.services.backtest import BacktestService
+from app.services.backtest_limits import validate_backtest_range
 from app.utils.agent_auth import (
     SCOPE_B, agent_required, current_token, current_user_id,
     instrument_allowed, market_allowed, with_idempotency,
@@ -69,6 +70,18 @@ def _run_backtest(payload: dict) -> Any:
         payload.get("strategy_config") or payload.get("strategyConfig") or {},
         strict_mode,
     )
+    indicator_params = payload.get("indicator_params") or payload.get("params") or {}
+    warmup_bars = _backtest._estimate_warmup_bars(code, indicator_params)
+    range_error = validate_backtest_range(
+        market=market,
+        symbol=symbol,
+        timeframe=timeframe,
+        start_date=start_date,
+        end_date=end_date.replace(hour=23, minute=59, second=59),
+        warmup_bars=warmup_bars,
+    )
+    if range_error:
+        raise ValueError(range_error["msg"])
 
     return _backtest.run_aligned(
         strict_mode=strict_mode,
@@ -84,7 +97,7 @@ def _run_backtest(payload: dict) -> Any:
         leverage=int(payload.get("leverage") or 1),
         trade_direction=payload.get("trade_direction") or payload.get("tradeDirection") or "long",
         strategy_config=strategy_config,
-        indicator_params=payload.get("indicator_params") or payload.get("params") or {},
+        indicator_params=indicator_params,
         user_id=int(payload.get("__user_id") or 1),
     )
 

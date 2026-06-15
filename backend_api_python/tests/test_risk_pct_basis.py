@@ -7,6 +7,8 @@ any stale ``risk_pct_basis`` value on legacy strategies.
 """
 from __future__ import annotations
 
+import pytest
+
 from app.services.trading_executor import TradingExecutor
 
 
@@ -192,3 +194,100 @@ def test_half_percent_take_profit_triggers_correctly(monkeypatch):
     )
     assert sig is not None
     assert sig["reason"] == "server_take_profit"
+
+
+def test_live_trailing_waits_until_round_trip_fees_are_covered(monkeypatch):
+    """Tiny trailing settings must not create a net-losing profit-protection exit."""
+    ex = _make_executor()
+    ex._exchange_fee_cache = {}
+    cfg = {
+        "trailing_enabled": True,
+        "trailing_stop_pct": 0.03,        # flat config percent: 0.03% -> 0.0003
+        "trailing_activation_pct": 0.09,  # 0.09% -> 0.0009
+        "commission": 0.05,              # 0.05% taker fee
+        "enable_server_side_take_profit": True,
+    }
+    monkeypatch.setattr(ex, "_update_position", lambda *a, **k: None)
+
+    monkeypatch.setattr(ex, "_get_current_positions", lambda *a, **k: [
+        {"side": "long", "entry_price": 100.0, "size": 1.0,
+         "highest_price": 100.09, "lowest_price": 100.0, "symbol": "BTC/USDT"}
+    ])
+    sig = ex._server_side_take_profit_or_trailing_signal(
+        strategy_id=1, symbol="BTC/USDT", current_price=100.059,
+        market_type="swap", leverage=10.0,
+        trading_config=cfg, timeframe_seconds=60,
+    )
+    assert sig is None
+
+    monkeypatch.setattr(ex, "_get_current_positions", lambda *a, **k: [
+        {"side": "long", "entry_price": 100.0, "size": 1.0,
+         "highest_price": 100.20, "lowest_price": 100.0, "symbol": "BTC/USDT"}
+    ])
+    sig = ex._server_side_take_profit_or_trailing_signal(
+        strategy_id=1, symbol="BTC/USDT", current_price=100.16,
+        market_type="swap", leverage=10.0,
+        trading_config=cfg, timeframe_seconds=60,
+    )
+    assert sig is not None
+    assert sig["type"] == "close_long"
+    assert sig["reason"] == "server_trailing_stop"
+    assert sig["trigger_price"] == pytest.approx(100.16)
+    assert sig["position_size"] == pytest.approx(1.0)
+    assert sig["matched_entry_price"] == pytest.approx(100.0)
+
+
+def test_backtest_trailing_profit_guard_uses_round_trip_fees():
+    from app.utils.risk_guard import trailing_exit_locks_net_profit
+
+    assert not trailing_exit_locks_net_profit(
+        "long", entry_price=100.0, exit_price=100.05, fee_rate=0.0005
+    )
+    assert trailing_exit_locks_net_profit(
+        "long", entry_price=100.0, exit_price=100.11, fee_rate=0.0005
+    )
+    assert not trailing_exit_locks_net_profit(
+        "short", entry_price=100.0, exit_price=99.95, fee_rate=0.0005
+    )
+    assert trailing_exit_locks_net_profit(
+        "short", entry_price=100.0, exit_price=99.89, fee_rate=0.0005
+    )
+
+
+def test_indicator_exit_owner_disables_server_side_price_exits(monkeypatch):
+    ex = _make_executor()
+    ex._exchange_fee_cache = {}
+    cfg = {
+        "enable_server_side_stop_loss": True,
+        "enable_server_side_take_profit": True,
+        "_strategy_cfg_from_code": {
+            "exitOwner": "indicator",
+            "risk": {
+                "stopLossPct": 0.01,
+                "takeProfitPct": 0.01,
+                "trailing": {
+                    "enabled": True,
+                    "pct": 0.001,
+                    "activationPct": 0.001,
+                },
+            },
+            "position": {"entryPct": 1.0},
+        },
+    }
+    monkeypatch.setattr(ex, "_get_current_positions", lambda *a, **k: [
+        {"side": "long", "entry_price": 100.0, "size": 1.0,
+         "highest_price": 110.0, "lowest_price": 90.0, "symbol": "BTC/USDT"}
+    ])
+    monkeypatch.setattr(ex, "_update_position", lambda *a, **k: None)
+
+    assert ex._server_side_stop_loss_signal(
+        strategy_id=1, symbol="BTC/USDT", current_price=50.0,
+        market_type="swap", leverage=10.0,
+        trading_config=cfg, timeframe_seconds=60,
+    ) is None
+
+    assert ex._server_side_take_profit_or_trailing_signal(
+        strategy_id=1, symbol="BTC/USDT", current_price=120.0,
+        market_type="swap", leverage=10.0,
+        trading_config=cfg, timeframe_seconds=60,
+    ) is None

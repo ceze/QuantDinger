@@ -32,6 +32,7 @@ my_indicator_description = "{safe_desc}"
 # ===== 平台默认风控（引擎退出；指标内勿再写窄 tp/sl）=====
 # 单位：0–1 小数比例（与回测/实盘一致；按标的涨跌幅，不除杠杆）
 #   stopLossPct 0.03 = 3% 价格止损；0.001 = 0.1%；entryPct 1 = 100% 资金
+# close_* 只表达均线反转时的结构性平仓；若改成 TP/SL/轨道触及退出，请改为 exit_owner: indicator。
 # @strategy stopLossPct 0.03
 # @strategy takeProfitPct 0.06
 # @strategy entryPct 0.25
@@ -60,6 +61,7 @@ golden = (ema_fast > ema_slow) & (ema_fast.shift(1) <= ema_slow.shift(1))
 death = (ema_fast < ema_slow) & (ema_fast.shift(1) >= ema_slow.shift(1))
 
 # 反手 bar：同根 K 先平对侧再开（R2）；仅趋势翻转时触发
+# 这些 close_* 不是指标内固定止盈/止损；价格风控仍由 exit_owner: engine 负责。
 raw_open_long = golden
 raw_open_short = death
 raw_close_long = death

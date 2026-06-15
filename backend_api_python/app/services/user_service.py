@@ -57,6 +57,7 @@ class UserService:
     """User management service"""
 
     _password_changed_column_ready = False
+    BOOTSTRAP_DEFAULT_PASSWORD = '123456'
     
     # Available roles (ordered by privilege level)
     ROLES = ['viewer', 'user', 'manager', 'admin']
@@ -120,6 +121,119 @@ class UserService:
         except Exception as e:
             logger.warning(f"mark_password_changed failed for user {user_id}: {e}")
 
+    @classmethod
+    def _configured_admin_password(cls) -> str:
+        """Return the current bootstrap admin password from env/config."""
+        try:
+            from app.config.settings import Config
+            return str(Config.ADMIN_PASSWORD or '')
+        except Exception:
+            return str(os.getenv('ADMIN_PASSWORD', '') or '')
+
+    @classmethod
+    def _is_bootstrap_default_plain_password(cls, password: str) -> bool:
+        return str(password or '') == cls.BOOTSTRAP_DEFAULT_PASSWORD
+
+    @classmethod
+    def _configured_admin_password_is_default(cls) -> bool:
+        return cls._is_bootstrap_default_plain_password(cls._configured_admin_password())
+
+    def _password_hash_matches_bootstrap_default(self, password_hash: str) -> bool:
+        password_hash = str(password_hash or '').strip()
+        if not password_hash:
+            return False
+        return self.verify_password(self.BOOTSTRAP_DEFAULT_PASSWORD, password_hash)
+
+    def _initial_password_state(self, password_hash: str, password_changed_at: Any) -> str:
+        """
+        Classify bootstrap password state for the first user.
+
+        Returns:
+            ok: no reminder/action needed
+            must_change: still using the unsafe built-in default password
+            sync_env_password: env ADMIN_PASSWORD is non-default but DB still has 123456
+            mark_changed: DB password is non-default, but password_changed_at was never set
+        """
+        if password_changed_at is not None:
+            return 'ok'
+        if not str(password_hash or '').strip():
+            return 'ok'
+        if self._password_hash_matches_bootstrap_default(password_hash):
+            if self._configured_admin_password_is_default():
+                return 'must_change'
+            return 'sync_env_password'
+        return 'mark_changed'
+
+    def _sync_bootstrap_admin_password_from_env(self, user_id: int, password_hash: str) -> bool:
+        """
+        If operators changed ADMIN_PASSWORD in .env after DB bootstrap, migrate the
+        first user's DB password away from the hard-coded default.
+        """
+        env_password = self._configured_admin_password()
+        if self._is_bootstrap_default_plain_password(env_password):
+            return False
+        if not env_password:
+            return False
+        if not self._password_hash_matches_bootstrap_default(password_hash):
+            return False
+
+        try:
+            new_hash = self.hash_password(env_password)
+            with get_db_connection() as db:
+                cur = db.cursor()
+                cur.execute(
+                    """
+                    UPDATE qd_users
+                    SET password_hash = ?, password_changed_at = NOW(), updated_at = NOW()
+                    WHERE id = ?
+                    """,
+                    (new_hash, user_id),
+                )
+                db.commit()
+                cur.close()
+            logger.info("Synchronized bootstrap admin password from non-default ADMIN_PASSWORD")
+            return True
+        except Exception as e:
+            logger.warning(f"sync bootstrap admin password failed for user {user_id}: {e}")
+            return False
+
+    def sync_bootstrap_admin_password_from_env(self) -> bool:
+        """Repair bootstrap admin password if env was changed after DB creation."""
+        first_id = self.get_first_user_id()
+        if first_id is None:
+            return False
+        if self._configured_admin_password_is_default():
+            return False
+
+        self.ensure_password_changed_column()
+        try:
+            with get_db_connection() as db:
+                cur = db.cursor()
+                cur.execute(
+                    """
+                    SELECT password_hash, password_changed_at
+                    FROM qd_users WHERE id = ?
+                    """,
+                    (first_id,),
+                )
+                row = cur.fetchone()
+                cur.close()
+            if not row:
+                return False
+            state = self._initial_password_state(
+                row.get('password_hash'),
+                row.get('password_changed_at'),
+            )
+            if state != 'sync_env_password':
+                return False
+            return self._sync_bootstrap_admin_password_from_env(
+                int(first_id),
+                str(row.get('password_hash') or ''),
+            )
+        except Exception as e:
+            logger.warning(f"sync_bootstrap_admin_password_from_env failed: {e}")
+            return False
+
     def get_first_user_id(self) -> Optional[int]:
         """Return the lowest user id (bootstrap / first account created on install)."""
         try:
@@ -137,9 +251,9 @@ class UserService:
 
     def must_change_initial_password(self, user_id: int) -> bool:
         """
-        True only for the first user (id = MIN(qd_users.id)) when they still use
-        the bootstrap password from deployment. Other admins are never prompted.
-        Code-login users without a password are excluded.
+        True only for the first user when they still use the unsafe built-in
+        bootstrap password (123456). Operators may set ADMIN_PASSWORD in .env;
+        if they do, a NULL password_changed_at alone must not force a prompt.
         """
         first_id = self.get_first_user_id()
         if first_id is None or int(user_id) != first_id:
@@ -163,7 +277,15 @@ class UserService:
             password_hash = str(row.get('password_hash') or '').strip()
             if not password_hash:
                 return False
-            return row.get('password_changed_at') is None
+            state = self._initial_password_state(password_hash, row.get('password_changed_at'))
+            if state == 'must_change':
+                return True
+            if state == 'sync_env_password':
+                self._sync_bootstrap_admin_password_from_env(int(user_id), password_hash)
+                return False
+            if state == 'mark_changed':
+                self.mark_password_changed(int(user_id))
+            return False
         except Exception as e:
             logger.warning(f"must_change_initial_password failed for user {user_id}: {e}")
             return False
@@ -493,6 +615,8 @@ class UserService:
 
                 # Seed default watchlist + builtin indicator samples for new users (FTUE)
                 if user_id:
+                    if password and not self._is_bootstrap_default_plain_password(password):
+                        self.mark_password_changed(int(user_id))
                     try:
                         _seed_default_watchlist(db, user_id)
                     except Exception as seed_err:
@@ -818,6 +942,8 @@ class UserService:
                         'email_verified': True  # Admin email is pre-verified
                     })
                     logger.info(f"Created admin user: {admin_user} ({admin_email})")
+                else:
+                    self.sync_bootstrap_admin_password_from_env()
         except Exception as e:
             logger.error(f"ensure_admin_exists failed: {e}")
 

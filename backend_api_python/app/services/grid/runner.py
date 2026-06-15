@@ -127,7 +127,17 @@ class GridRestingRunner:
 
     def startup(self, current_price: float, *, bars_df: Any = None) -> tuple[bool, str]:
         cfg = GridBotConfig.from_trading_config(self.trading_config)
-        ok, msg, warnings = validate_grid_config(cfg, initial_capital=float(self.trading_config.get("initial_capital") or 0))
+        try:
+            fee_rate = float(self.trading_config.get("commission") or 0.0) / 100.0
+        except Exception:
+            fee_rate = 0.0
+        if fee_rate <= 0:
+            fee_rate = 0.001
+        ok, msg, warnings = validate_grid_config(
+            cfg,
+            initial_capital=float(self.trading_config.get("initial_capital") or 0),
+            fee_rate=fee_rate,
+        )
         if not ok:
             return False, msg
         for w in warnings:

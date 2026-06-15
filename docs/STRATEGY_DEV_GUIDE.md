@@ -104,6 +104,10 @@ At the top of the script, define name, description, tunable params, and strategy
 my_indicator_name = "Trend Pullback Strategy"
 my_indicator_description = "Buy pullbacks in an uptrend and exit on weakness."
 
+# signal_form: two_way
+# exit_owner: engine
+# flip_mode: R2
+
 # @param fast_len int 20 Fast EMA length
 # @param slow_len int 50 Slow EMA length
 # @param rsi_len int 14 RSI length
@@ -237,7 +241,7 @@ If backtests show "close short then open long" on the same bar, that is usually 
 
 This is where stop-loss, take-profit, and position management usually become confusing.
 
-There are **two valid exit styles** in `IndicatorStrategy`.
+There are **two valid exit styles** in `IndicatorStrategy`, and the header contract must make the choice explicit.
 
 #### Style A: Signal-managed exits
 
@@ -252,6 +256,15 @@ Examples:
 
 Use this style when the exit is part of the strategy idea itself.
 
+Declare it like this:
+
+```python
+# exit_owner: indicator
+# @strategy trailingEnabled false
+```
+
+The current backend interprets `exit_owner: indicator` as: server-side fixed stop-loss, fixed take-profit, and trailing stop do not close positions. Exits come from indicator signals. `entryPct` / `tradeDirection` can still be used as defaults.
+
 #### Style B: Engine-managed exits
 
 You let the strategy engine apply fixed defaults declared with `# @strategy`, such as:
@@ -263,16 +276,24 @@ You let the strategy engine apply fixed defaults declared with `# @strategy`, su
 
 Use this style when the signal logic should stay simple, and you want the engine to handle fixed protective rules.
 
+Declare it like this:
+
+```python
+# exit_owner: engine
+```
+
+`exit_owner: engine` keeps server-side price risk active. You may still keep structural reverse `close_*` signals, but do not also encode tight in-indicator TP/SL touch exits.
+
 #### Best practice
 
 Pick one primary owner for exits whenever possible.
 
 For example:
 
-- if your edge is "enter on crossover, exit on reverse crossover", keep that in `buy` / `sell`
-- if your edge is "enter on signal and let a fixed 3% stop + 6% target manage the trade", use `# @strategy`
+- if your edge is "enter on crossover, exit on reverse crossover" with no extra fixed price-risk exits, make indicator signals the owner and write `# exit_owner: indicator`
+- if your edge is "enter on signal and let a fixed 3% stop + 6% target manage the trade", or if `close_*` only represents structural trend reversal, make the engine the price-exit owner and write `# exit_owner: engine`
 
-You *can* combine them, but document it clearly so other developers know whether an exit is signal-driven, engine-driven, or both.
+Do not write `exit_owner: layered`. The current platform does not implement a third owner. If you truly need a mixed design, write it as `engine` and document which `close_*` signals are structural reversals rather than tight TP/SL.
 
 ### 3.5 Step 5: Build the `output` object
 
@@ -341,7 +362,7 @@ If your logic uses `high >= line` / `low <= line`, backtests are often **later**
 Alignment tips:
 
 - Set `signal_mode` and `exit_signal_mode` to **`confirmed`** when you want live to track closed-bar backtests.
-- Do not combine in-indicator TP/SL columns with `# @strategy trailingEnabled true` unless you document which path wins (see §11.7).
+- If in-indicator `sig_*_tp` / `sig_*_sl` exits exist, declare `# exit_owner: indicator` and keep `# @strategy trailingEnabled false`; otherwise indicator exits plus server trailing can duplicate closes and amplify timing drift.
 - Before going live, compare backtest fills with logs for `Signal submitted` and `server_trailing_stop`.
 
 If a live close briefly shows amount `0`, the worker **re-syncs exchange positions and resolves size again**; rejection happens only when the exchange is already flat.
@@ -524,6 +545,10 @@ This version is closer to how developers actually use QuantDinger today:
 ```python
 my_indicator_name = "Breakout Retest With Direction Control"
 my_indicator_description = "Breakout-and-retest logic with platform-friendly params and default risk settings."
+
+# signal_form: two_way
+# exit_owner: engine
+# flip_mode: R2
 
 # @param breakout_len int 20 Breakout lookback bars
 # @param retest_buffer float 0.002 Retest tolerance ratio
@@ -1193,20 +1218,26 @@ Better (pick one primary exit path and comment it):
 
 ```python
 # Option A: exits only from indicator signals (touch-based strategies)
+# exit_owner: indicator
 # @strategy trailingEnabled false
+# Primary exit: close_* or tp/sl conditions inside df['buy'] / df['sell']
+# stopLossPct / takeProfitPct / trailing* are not server-side exits
 
 # Option B: exits from engine risk (fixed SL/TP/trailing)
+# exit_owner: engine
 # @strategy trailingEnabled true
 # @strategy trailingStopPct 0.0025
 # @strategy trailingActivationPct 0.0037
-# df['buy'] / df['sell'] should focus on entries only
+# df['buy'] / df['sell'] or open_* should focus on entries;
+# structural reverse close_* is OK, tight in-indicator tp/sl is not
 ```
 
 Why:
 
 - duplicate exits produce `server_trailing_stop` next to indicator closes, timing skew, and sometimes `invalid amount (0.0)` when the position is already flat.
-- `trailingEnabled true` disables conflicting fixed take-profit semantics but **does not** disable your in-code tp/sl booleans.
-- the real problem is when nobody knows which exit path is supposed to dominate.
+- `exit_owner: indicator` disables server-side fixed stop-loss, fixed take-profit, and trailing stop in backtest/live; those `# @strategy` exit fields no longer close the position.
+- `exit_owner: engine` keeps server-side price risk active; indicator `close_*` signals should express structural reversals, not a second tight TP/SL system.
+- the real problem is when nobody knows which exit path is supposed to dominate; `exit_owner` is the boundary.
 
 ### 11.8 Putting all tp/sl flags into `buy` / `sell` under `both`
 
@@ -1222,10 +1253,10 @@ Under `both`, `short_tp` inside `buy` is a **flip-long** intent, not flat-only. 
 
 Common causes:
 
-1. Server trailing/TP already closed the leg; an indicator `close_*` was still submitted.
+1. Server stop-loss / take-profit / trailing already closed the leg; an indicator `close_*` was still submitted.
 2. Local DB lag vs the exchange — the worker retries **sync + exchange size** before rejecting.
 
-Mitigation: §11.7 (one exit owner), §3.3.1 (`both` semantics).
+Mitigation: §11.7 (one exit owner), §3.3.1 (`both` semantics). If the indicator owns TP/SL, use `# exit_owner: indicator`; if the engine owns price exits, do not also write tight in-indicator TP/SL booleans.
 
 ---
 
@@ -1251,10 +1282,28 @@ Important:
 - **all values use 0–1 decimal ratios** (same as `StrategyConfigParser`, backtest, and live)
 - **stop/take-profit/trailing thresholds are underlying price moves, not divided by leverage**
 - **`entryPct 1` means 100% of available capital**, not 1%
+- with `# exit_owner: indicator`, `stopLossPct` / `takeProfitPct` / `trailing*` do not trigger server-side closes in backtest or live; exits come from indicator signals
+- with `# exit_owner: engine`, those server-side price-risk fields are active
 - do not put `leverage` in `# @strategy`
 - keep exchange, symbol, credentials, and leverage in product configuration
 
-### 12.2 `# @param` quick format
+### 12.2 Contract header comments
+
+| Key | Values | Meaning |
+|-----|--------|---------|
+| `signal_form` | `two_way` / `four_way` | Execution signal form |
+| `exit_owner` | `indicator` / `engine` | Price-exit owner; `layered` is not supported |
+| `flip_mode` | `R1` / `R2` | Flip timing: R1 opens on the next bar; R2 closes then opens on the same bar |
+
+Recommended top-of-file block:
+
+```python
+# signal_form: four_way
+# exit_owner: indicator
+# flip_mode: R1
+```
+
+### 12.3 `# @param` quick format
 
 | Part | Example | Meaning |
 |------|---------|---------|

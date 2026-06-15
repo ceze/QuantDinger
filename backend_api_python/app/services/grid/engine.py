@@ -596,6 +596,27 @@ class GridEngine:
                 total += qty
         return total
 
+    def _cell_cost_basis(self, cell_index: int, purpose: str, fallback: float) -> float:
+        """Preserve a held cell's entry price when re-hanging reduce-only exits."""
+        try:
+            rows = self._cells.list_cells(self.strategy_id, self.symbol)
+        except Exception:
+            rows = []
+        for cell in rows or []:
+            try:
+                if int(getattr(cell, "cell_index", -1)) != int(cell_index):
+                    continue
+                entry = float(getattr(cell, "leg_entry_price", 0.0) or 0.0)
+                if entry > 0:
+                    return entry
+                if purpose == "long_exit":
+                    return float(getattr(cell, "lower_price", 0.0) or fallback or 0.0)
+                if purpose == "short_exit":
+                    return float(getattr(cell, "upper_price", 0.0) or fallback or 0.0)
+            except Exception:
+                continue
+        return float(fallback or 0.0)
+
     def _open_orders_for_cell(self, cell_index: int, purpose: str) -> List[GridRestingOrder]:
         out: List[GridRestingOrder] = []
         for order in self._orders.list_open(self.strategy_id):
@@ -969,20 +990,23 @@ class GridEngine:
                 return False
             st = GridCellState.BUY_OPEN if side == "buy" else GridCellState.SELL_OPEN
             if reduce_only and pos_side == "long":
-                st = GridCellState.SELL_OPEN
+                st = GridCellState.LONG_HELD
             elif reduce_only and pos_side == "short":
-                st = GridCellState.BUY_OPEN
+                st = GridCellState.SHORT_HELD
             elif purpose == "long_entry":
                 st = GridCellState.BUY_OPEN
             elif purpose == "short_entry":
                 st = GridCellState.SELL_OPEN
+            leg_entry_price = px
+            if reduce_only:
+                leg_entry_price = self._cell_cost_basis(cell.index, purpose, fallback=px)
             self._cells.update_state(
                 self.strategy_id,
                 self.symbol,
                 cell.index,
                 state=st,
                 leg_size=qty,
-                leg_entry_price=px,
+                leg_entry_price=leg_entry_price,
                 working_order_id=ex_oid or coid,
             )
             append_strategy_log(

@@ -13,6 +13,15 @@ USER_SAMPLE_CODE = """
 # @strategy takeProfitPct 0.25
 """
 
+INDICATOR_OWNED_EXIT_CODE = """
+# signal_form: four_way
+# exit_owner: indicator
+# flip_mode: R1
+# @strategy trailingEnabled true
+# @strategy trailingStopPct 0.0003
+# @strategy trailingActivationPct 0.0009
+"""
+
 
 def test_normalize_entry_ratio():
     assert StrategyConfigParser.normalize_entry_ratio(1) == 1.0
@@ -47,3 +56,21 @@ def test_build_nested_cfg_from_code_user_sample():
     assert cfg["risk"]["trailing"]["activationPct"] == 0.0037
     assert cfg["risk"]["trailing"]["enabled"] is True
     assert cfg["tradeDirection"] == "both"
+
+
+def test_exit_owner_header_is_parsed_into_flat_and_nested_config():
+    flat = StrategyConfigParser.to_trading_config_risk_flat(INDICATOR_OWNED_EXIT_CODE)
+    assert flat["exit_owner"] == "indicator"
+    assert flat["trailing_enabled"] is True
+
+    cfg = StrategyConfigParser.build_nested_cfg_from_code(INDICATOR_OWNED_EXIT_CODE)
+    assert cfg["exitOwner"] == "indicator"
+    assert cfg["risk"]["trailing"]["enabled"] is True
+
+
+def test_contract_headers_can_share_one_comment_line():
+    code = "# signal_form: four_way    exit_owner: indicator    flip_mode: R1\n"
+    headers = StrategyConfigParser.parse_contract_headers(code)
+    assert headers["signal_form"] == "four_way"
+    assert headers["exit_owner"] == "indicator"
+    assert headers["flip_mode"] == "R1"

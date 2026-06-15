@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -26,7 +27,6 @@ from app.services.live_trading.records import (
     strategy_allowed_symbols,
 )
 from app.services.live_trading.strategy_position_sync import (
-    apply_exchange_snapshot_to_strategy_ledger,
     strategy_uses_fill_ledger,
 )
 from app.services.live_trading.account_positions import (
@@ -90,6 +90,8 @@ MT5Client = None
 AlpacaClient = None
 
 logger = get_logger(__name__)
+
+ALPACA_FILL_DELTA_EPSILON = 1e-8
 
 # PositionSync: one exchange snapshot per credential per TTL window. Many
 # strategies can share the same API key, so this avoids repeated get_positions
@@ -202,6 +204,18 @@ def _persist_strategy_fill(
     inst_id: str = "",
 ) -> Tuple[Optional[float], Optional[float]]:
     """Apply fill to L3 snapshot and append L2 trade row."""
+    filled_qty = float(filled or 0.0)
+    avg_px = float(avg_price or 0.0)
+    if abs(filled_qty) <= 1e-12:
+        logger.info(
+            "Skip zero-sized strategy fill: strategy_id=%s symbol=%s signal=%s order_id=%s source=%s",
+            strategy_id,
+            symbol,
+            signal_type,
+            order_id,
+            fill_source,
+        )
+        return profit, matched_entry_price
     leg = resolve_leg_context(
         strategy_id=int(strategy_id),
         symbol=str(symbol or ""),
@@ -215,8 +229,8 @@ def _persist_strategy_fill(
         strategy_id=int(strategy_id),
         symbol=str(symbol or ""),
         signal_type=str(signal_type or ""),
-        filled=float(filled or 0.0),
-        avg_price=float(avg_price or 0.0),
+        filled=filled_qty,
+        avg_price=avg_px,
         leg=leg,
     )
     if profit is None:
@@ -227,8 +241,8 @@ def _persist_strategy_fill(
         strategy_id=int(strategy_id),
         symbol=str(symbol or ""),
         trade_type=str(signal_type or ""),
-        price=float(avg_price or 0.0),
-        amount=float(filled or 0.0),
+        price=avg_px,
+        amount=filled_qty,
         commission=float(commission or 0.0),
         commission_ccy=str(commission_ccy or ""),
         profit=profit,
@@ -343,6 +357,7 @@ class PendingOrderWorker:
 
     def _tick(self) -> None:
         # logger.info(f"[PendingOrderWorker] _tick start. last_sync={self._last_position_sync_ts}")
+        self._sync_alpaca_sent_orders()
         orders = self._fetch_pending_orders(limit=self.batch_size)
         # logger.info(f"[PendingOrderWorker] orders fetched: {len(orders)}")
         if not orders:
@@ -973,33 +988,10 @@ class PendingOrderWorker:
                 else:
                     logger.info(f"[PositionSync] Strategy {sid} ({safe_cfg.get('exchange_id', 'unknown')}) has NO positions on exchange.")
 
-                # 3) L3 reconcile: upsert allowed strategy symbols from exchange;
-                # delete legs that are flat. Scoped to strategy_allowed_symbols only.
-                try:
-                    written = apply_exchange_snapshot_to_strategy_ledger(
-                        strategy_id=int(sid),
-                        strategy_config={
-                            "symbol": sc.get("symbol"),
-                            "trading_config": sc.get("trading_config") or {},
-                        },
-                        exch_size=exch_size,
-                        exch_entry_price=exch_entry_price,
-                        exch_inst_id=exch_inst_id,
-                        market_type=str(market_type or "swap"),
-                        exchange_config=exchange_config if isinstance(exchange_config, dict) else {},
-                    )
-                    if written:
-                        logger.debug(
-                            "position sync: upserted %s L3 legs for strategy_id=%s",
-                            written,
-                            sid,
-                        )
-                except Exception as l3_err:
-                    logger.warning(
-                        "position sync: L3 ledger apply failed strategy_id=%s: %s",
-                        sid,
-                        l3_err,
-                    )
+                # Keep exchange truth in L1 only. Strategy positions (L3) must be
+                # produced by that strategy's own fills, otherwise two live
+                # strategies sharing ETH/USDT would both inherit the same
+                # exchange account position.
             except Exception as e:
                 msg = str(e)
                 if is_fatal_exchange_error(msg):
@@ -1007,6 +999,239 @@ class PendingOrderWorker:
                     auto_stop_live_strategy(int(sid), msg, source="position_sync")
                 else:
                     logger.error(f"position sync: strategy_id={sid} failed: {e}", exc_info=True)
+
+    def _sync_alpaca_sent_orders(self, limit: int = 50) -> None:
+        rows = self._fetch_alpaca_sent_orders(limit=limit)
+        for row in rows:
+            try:
+                self._sync_one_alpaca_sent_order(row)
+            except Exception as e:
+                logger.warning(
+                    "Alpaca fill sync failed: pending_id=%s err=%s",
+                    row.get("id"),
+                    e,
+                )
+
+    def _fetch_alpaca_sent_orders(self, limit: int = 50) -> List[Dict[str, Any]]:
+        try:
+            try:
+                stale_sec = int(self._stale_processing_sec or 0)
+            except Exception:
+                stale_sec = 0
+            if stale_sec > 0:
+                with get_db_connection() as db:
+                    cur = db.cursor()
+                    cur.execute(
+                        """
+                        UPDATE pending_orders
+                        SET status = 'sent',
+                            dispatch_note = 'alpaca_fill_sync:requeued_stale_sync',
+                            updated_at = NOW()
+                        WHERE status = 'syncing'
+                          AND LOWER(COALESCE(exchange_id, '')) = 'alpaca'
+                          AND updated_at < NOW() - (%s * INTERVAL '1 second')
+                        """,
+                        (stale_sec,),
+                    )
+                    db.commit()
+                    cur.close()
+            with get_db_connection() as db:
+                cur = db.cursor()
+                cur.execute(
+                    """
+                    SELECT *
+                    FROM pending_orders
+                    WHERE status = 'sent'
+                      AND LOWER(COALESCE(exchange_id, '')) = 'alpaca'
+                      AND COALESCE(exchange_order_id, '') <> ''
+                    ORDER BY sent_at ASC NULLS FIRST, id ASC
+                    LIMIT %s
+                    """,
+                    (int(limit),),
+                )
+                rows = cur.fetchall() or []
+                cur.close()
+            return rows
+        except Exception as e:
+            logger.warning("fetch_alpaca_sent_orders failed: %s", e)
+            return []
+
+    def _claim_alpaca_sent_order(self, order_id: int) -> Optional[Dict[str, Any]]:
+        """Atomically claim one Alpaca sent order for fill sync."""
+        if int(order_id or 0) <= 0:
+            return None
+        try:
+            with get_db_connection() as db:
+                cur = db.cursor()
+                cur.execute(
+                    """
+                    UPDATE pending_orders
+                    SET status = 'syncing',
+                        dispatch_note = 'alpaca_fill_sync:syncing',
+                        updated_at = NOW()
+                    WHERE id = %s
+                      AND status = 'sent'
+                      AND LOWER(COALESCE(exchange_id, '')) = 'alpaca'
+                      AND COALESCE(exchange_order_id, '') <> ''
+                    RETURNING *
+                    """,
+                    (int(order_id),),
+                )
+                row = cur.fetchone()
+                db.commit()
+                cur.close()
+            return row if isinstance(row, dict) else None
+        except Exception as e:
+            logger.warning("claim_alpaca_sent_order failed: pending_id=%s err=%s", order_id, e)
+            return None
+
+    def _sync_one_alpaca_sent_order(self, row: Dict[str, Any]) -> None:
+        order_id = int(row.get("id") or 0)
+        if order_id <= 0:
+            return
+        claimed = self._claim_alpaca_sent_order(order_id)
+        if not claimed:
+            return
+        row = claimed
+        exchange_order_id = str(row.get("exchange_order_id") or "").strip()
+        if not exchange_order_id:
+            return
+
+        payload = {}
+        payload_json = row.get("payload_json") or ""
+        if isinstance(payload_json, str) and payload_json.strip():
+            try:
+                payload = json.loads(payload_json) or {}
+            except Exception:
+                payload = {}
+
+        strategy_id = int(payload.get("strategy_id") or row.get("strategy_id") or 0)
+        if strategy_id <= 0:
+            return
+
+        sc = load_strategy_configs(strategy_id)
+        exchange_config = resolve_exchange_config(sc.get("exchange_config") or {}, user_id=int(sc.get("user_id") or 1))
+        if str(exchange_config.get("exchange_id") or "").strip().lower() != "alpaca":
+            return
+
+        try:
+            client = create_client(exchange_config)
+        except Exception as e:
+            logger.warning("Alpaca fill sync create_client failed: pending_id=%s err=%s", order_id, e)
+            return
+
+        global AlpacaClient
+        if AlpacaClient is None:
+            try:
+                from app.services.alpaca_trading import AlpacaClient as _AlpacaClient
+                AlpacaClient = _AlpacaClient
+            except Exception:
+                AlpacaClient = None
+        if AlpacaClient is None or not isinstance(client, AlpacaClient):
+            return
+
+        result = client.get_order_status(exchange_order_id)
+        status = str(result.status or "").strip().lower()
+        cumulative_filled = float(result.filled or 0.0)
+        cumulative_avg = float(result.avg_price or 0.0)
+        previous_filled = float(row.get("filled") or 0.0)
+        previous_avg = float(row.get("avg_price") or 0.0)
+        raw_json = json.dumps(result.raw or {}, ensure_ascii=False)
+
+        delta = cumulative_filled - previous_filled
+        if delta > ALPACA_FILL_DELTA_EPSILON and cumulative_avg > 0:
+            delta_avg = cumulative_avg
+            if previous_filled > 0 and previous_avg > 0:
+                delta_notional = cumulative_filled * cumulative_avg - previous_filled * previous_avg
+                if delta_notional > 0:
+                    delta_avg = delta_notional / delta
+
+            signal_type = payload.get("signal_type") or row.get("signal_type")
+            symbol = payload.get("symbol") or row.get("symbol")
+            market_category = str(
+                sc.get("market_category")
+                or (sc.get("trading_config") or {}).get("market_category")
+                or "USStock"
+            )
+            market_type_for_client = "crypto" if market_category.lower() in ("crypto", "cryptocurrency") else "USStock"
+            profit, _matched_entry = _persist_strategy_fill(
+                strategy_id=strategy_id,
+                symbol=str(symbol or ""),
+                signal_type=str(signal_type or ""),
+                filled=float(delta),
+                avg_price=float(delta_avg),
+                exchange_config=exchange_config,
+                market_type=market_type_for_client,
+                order_id=order_id,
+                fill_source="worker_alpaca_fill_sync",
+                close_reason=_trade_close_reason_from_payload(payload, str(signal_type or "")),
+            )
+            _pstr = f", profit={profit:.4f}" if profit is not None else ""
+            append_strategy_log(
+                strategy_id,
+                "trade",
+                f"Alpaca fill synced: {signal_type} {symbol} filled={delta:.6f} @ {delta_avg:.6f}{_pstr}",
+            )
+
+        final_statuses = {"filled", "canceled", "cancelled", "rejected", "expired"}
+        new_status = "sent"
+        if status == "filled":
+            new_status = "filled"
+        elif status in ("canceled", "cancelled"):
+            new_status = "cancelled"
+        elif status in ("rejected", "expired"):
+            new_status = "failed"
+
+        self._update_alpaca_sent_order_snapshot(
+            order_id=order_id,
+            status=new_status,
+            exchange_status=status,
+            filled=cumulative_filled,
+            avg_price=cumulative_avg,
+            exchange_response_json=raw_json,
+            final=status in final_statuses,
+        )
+
+    def _update_alpaca_sent_order_snapshot(
+        self,
+        *,
+        order_id: int,
+        status: str,
+        exchange_status: str,
+        filled: float,
+        avg_price: float,
+        exchange_response_json: str,
+        final: bool,
+    ) -> None:
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute(
+                """
+                UPDATE pending_orders
+                SET status = %s,
+                    last_error = CASE WHEN %s = 'failed' THEN %s ELSE '' END,
+                    dispatch_note = %s,
+                    filled = %s,
+                    avg_price = %s,
+                    exchange_response_json = %s,
+                    executed_at = CASE WHEN %s THEN NOW() ELSE executed_at END,
+                    updated_at = NOW()
+                WHERE id = %s
+                """,
+                (
+                    str(status or "sent"),
+                    str(status or "sent"),
+                    str(exchange_status or ""),
+                    f"alpaca_fill_sync:{exchange_status or 'unknown'}",
+                    float(filled or 0.0),
+                    float(avg_price or 0.0),
+                    str(exchange_response_json or ""),
+                    bool(final and float(filled or 0.0) > 0),
+                    int(order_id),
+                ),
+            )
+            db.commit()
+            cur.close()
 
     def _fetch_pending_orders(self, limit: int = 50) -> List[Dict[str, Any]]:
         try:
@@ -1194,6 +1419,165 @@ class PendingOrderWorker:
             return {}
         except Exception:
             return {}
+
+    @staticmethod
+    def _as_float(value: Any, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except Exception:
+            return float(default)
+
+    def _estimate_min_order_notional(
+        self,
+        client: Any,
+        *,
+        symbol: str,
+        price: float,
+        market_order: bool = True,
+    ) -> Tuple[float, float]:
+        """Best-effort minQty/minNotional estimate from live client filters."""
+        px = float(price or 0.0)
+        if px <= 0 or client is None:
+            return 0.0, 0.0
+        try:
+            if not hasattr(client, "get_symbol_filters"):
+                return 0.0, 0.0
+            filters = client.get_symbol_filters(symbol=symbol) or {}
+            lot = {}
+            if isinstance(filters.get("MARKET_LOT_SIZE"), dict) and market_order:
+                lot = filters.get("MARKET_LOT_SIZE") or {}
+                try:
+                    if float(lot.get("minQty") or 0) <= 0:
+                        lot = filters.get("LOT_SIZE") or lot
+                except Exception:
+                    pass
+            if not lot and isinstance(filters.get("LOT_SIZE"), dict):
+                lot = filters.get("LOT_SIZE") or {}
+            min_qty = self._as_float((lot or {}).get("minQty"), 0.0)
+
+            min_notional = 0.0
+            notional_filter = filters.get("MIN_NOTIONAL") or filters.get("NOTIONAL") or {}
+            if isinstance(notional_filter, dict):
+                min_notional = self._as_float(
+                    notional_filter.get("notional")
+                    or notional_filter.get("minNotional")
+                    or notional_filter.get("minNotionalValue"),
+                    0.0,
+                )
+            if min_qty > 0:
+                min_notional = max(min_notional, min_qty * px)
+            return max(0.0, min_qty), max(0.0, min_notional)
+        except Exception:
+            return 0.0, 0.0
+
+    def _friendly_order_error(
+        self,
+        error: Any,
+        *,
+        client: Any,
+        exchange_id: str,
+        symbol: str,
+        signal_type: str,
+        amount: float,
+        price: float,
+        payload: Dict[str, Any],
+    ) -> str:
+        raw = str(error or "")
+        lower = raw.lower()
+        is_size_error = bool(
+            re.search(r"below|step|minqty|min qty|minsize|min size|min_notional|minnotional|invalid (qty|quantity|size|amount)", lower)
+        )
+        if not is_size_error:
+            return raw
+
+        px = float(price or payload.get("ref_price") or 0.0)
+        qty = float(amount or 0.0)
+        actual_notional = qty * px if px > 0 else 0.0
+        min_qty, min_notional = self._estimate_min_order_notional(
+            client,
+            symbol=str(symbol or ""),
+            price=px,
+            market_order=True,
+        )
+        sizing = payload.get("sizing") if isinstance(payload, dict) else {}
+        sizing = sizing if isinstance(sizing, dict) else {}
+        source = str(sizing.get("source") or "unknown")
+        entry_pct = sizing.get("entry_pct")
+        capital = sizing.get("initial_capital")
+        leverage = sizing.get("leverage") or payload.get("leverage")
+
+        parts = [
+            raw,
+            (
+                f"实际下单约 {actual_notional:.4f} USDT"
+                if actual_notional > 0
+                else f"实际下单数量 {qty:.12f}"
+            ),
+        ]
+        if min_notional > 0:
+            parts.append(f"按当前价估算至少约 {min_notional:.4f} USDT")
+        elif min_qty > 0:
+            parts.append(f"交易所最小数量约 {min_qty:.12f}")
+        if capital is not None or entry_pct is not None or leverage is not None:
+            parts.append(
+                "sizing="
+                f"capital={self._as_float(capital, 0.0):.4f}, "
+                f"entry_pct={self._as_float(entry_pct, 0.0):.4f}%, "
+                f"leverage={self._as_float(leverage, 1.0):.4f}x, "
+                f"source={source}"
+            )
+        parts.append("请提高投入金额、开仓比例或杠杆，或更换满足最小下单量的标的。")
+        return "；".join(parts)
+
+    def _log_live_order_sizing(
+        self,
+        *,
+        strategy_id: int,
+        client: Any,
+        symbol: str,
+        signal_type: str,
+        reduce_only: bool,
+        amount: float,
+        ref_price: float,
+        leverage: float,
+        payload: Dict[str, Any],
+        phases: Dict[str, Any],
+    ) -> None:
+        if reduce_only or signal_type not in ("open_long", "open_short", "add_long", "add_short"):
+            return
+        try:
+            min_qty, min_notional = self._estimate_min_order_notional(
+                client,
+                symbol=str(symbol or ""),
+                price=float(ref_price or 0.0),
+                market_order=True,
+            )
+            sizing = payload.get("sizing") if isinstance(payload, dict) else {}
+            sizing = sizing if isinstance(sizing, dict) else {}
+            append_strategy_log(
+                strategy_id,
+                "info",
+                (
+                    "Live order sizing: "
+                    f"capital={self._as_float(sizing.get('initial_capital'), 0.0):.4f}, "
+                    f"entry_pct={self._as_float(sizing.get('entry_pct'), 0.0):.4f}%, "
+                    f"leverage={self._as_float(sizing.get('leverage') or leverage, 1.0):.4f}x, "
+                    f"price={float(ref_price or 0.0):.8f}, "
+                    f"final_qty={float(amount or 0.0):.12f}, "
+                    f"min_qty={float(min_qty or 0.0):.12f}, "
+                    f"min_notional={float(min_notional or 0.0):.4f}, "
+                    f"source={sizing.get('source') or 'unknown'}"
+                ),
+            )
+            phases["sizing_check"] = {
+                "amount": float(amount or 0.0),
+                "ref_price": float(ref_price or 0.0),
+                "min_qty": float(min_qty or 0.0),
+                "min_notional": float(min_notional or 0.0),
+                "sizing": sizing,
+            }
+        except Exception:
+            return
 
     def _load_strategy_name(self, strategy_id: int) -> str:
         try:
@@ -1500,6 +1884,19 @@ class PendingOrderWorker:
                 )
                 phases["spot_prepare_error"] = str(e)
 
+        self._log_live_order_sizing(
+            strategy_id=strategy_id,
+            client=client,
+            symbol=symbol,
+            signal_type=signal_type,
+            reduce_only=reduce_only,
+            amount=amount,
+            ref_price=ref_price,
+            leverage=leverage,
+            payload=payload,
+            phases=phases,
+        )
+
         # Decide if we should use limit-first flow.
         use_limit_first = order_mode in ("maker", "limit", "limit_first", "maker_then_market")
 
@@ -1549,20 +1946,30 @@ class PendingOrderWorker:
                 phases["close_size_retry"]["error"] = str(e)
 
         if remaining <= 0 and not (spot_market_buy_uses_quote and spot_quote_amt > 0):
-            self._mark_failed(order_id=order_id, error="invalid_amount")
-            _notify_live_best_effort(status="failed", error="invalid_amount", amount_hint=amount)
+            friendly_error = self._friendly_order_error(
+                "invalid amount",
+                client=client,
+                exchange_id=exchange_id,
+                symbol=symbol,
+                signal_type=signal_type,
+                amount=amount,
+                price=ref_price,
+                payload=payload,
+            )
+            self._mark_failed(order_id=order_id, error=friendly_error)
+            _notify_live_best_effort(status="failed", error=friendly_error, amount_hint=amount)
             if reduce_only:
                 append_strategy_log(
                     strategy_id,
                     "error",
-                    f"Order rejected: invalid amount ({amount}) for {symbol} {signal_type} "
+                    f"Order rejected: {friendly_error} for {symbol} {signal_type} "
                     f"(no position after sync; check exchange/DB alignment)",
                 )
             else:
                 append_strategy_log(
                     strategy_id,
                     "error",
-                    f"Order rejected: invalid amount ({amount}) for {symbol} {signal_type}",
+                    f"Order rejected: {friendly_error} for {symbol} {signal_type}",
                 )
             return
 
@@ -1633,8 +2040,18 @@ class PendingOrderWorker:
             except LiveTradingError as e:
                 logger.warning(f"live limit phase failed: pending_id={order_id}, strategy_id={strategy_id}, cfg={safe_cfg}, err={e}")
                 remaining = float(amount or 0.0)
-                phases["limit_error"] = str(e)
-                append_strategy_log(strategy_id, "error", f"Exchange limit order failed ({exchange_id} {symbol}): {e}, falling back to market")
+                friendly_error = self._friendly_order_error(
+                    e,
+                    client=client,
+                    exchange_id=exchange_id,
+                    symbol=symbol,
+                    signal_type=signal_type,
+                    amount=amount,
+                    price=ref_price,
+                    payload=payload,
+                )
+                phases["limit_error"] = friendly_error
+                append_strategy_log(strategy_id, "error", f"Exchange limit order failed ({exchange_id} {symbol}): {friendly_error}, falling back to market")
             except Exception as e:
                 logger.warning(f"live limit phase unexpected error: pending_id={order_id}, strategy_id={strategy_id}, cfg={safe_cfg}, err={e}")
                 remaining = float(amount or 0.0)
@@ -1684,18 +2101,28 @@ class PendingOrderWorker:
                 apply_fill_snapshot(fills, q2)
             except LiveTradingError as e:
                 logger.warning(f"live market phase failed: pending_id={order_id}, strategy_id={strategy_id}, cfg={safe_cfg}, err={e}")
-                phases["market_error"] = str(e)
+                friendly_error = self._friendly_order_error(
+                    e,
+                    client=client,
+                    exchange_id=exchange_id,
+                    symbol=symbol,
+                    signal_type=signal_type,
+                    amount=amount,
+                    price=ref_price,
+                    payload=payload,
+                )
+                phases["market_error"] = friendly_error
                 if float(fills.total_base or 0.0) > 0:
                     _console_print(
                         f"[worker] market tail failed but partial filled: strategy_id={strategy_id} pending_id={order_id} filled={fills.total_base} err={e}"
                     )
                     remaining = 0.0
-                    append_strategy_log(strategy_id, "error", f"Exchange market order partially failed ({symbol} {signal_type}): {e} (partial filled={fills.total_base})")
+                    append_strategy_log(strategy_id, "error", f"Exchange market order partially failed ({symbol} {signal_type}): {friendly_error} (partial filled={fills.total_base})")
                 else:
-                    self._mark_failed(order_id=order_id, error=str(e))
-                    _console_print(f"[worker] order failed: strategy_id={strategy_id} pending_id={order_id} err={e}")
-                    _notify_live_best_effort(status="failed", error=str(e), amount_hint=amount, price_hint=ref_price)
-                    append_strategy_log(strategy_id, "error", f"Exchange order failed ({exchange_id} {symbol} {signal_type}): {e}")
+                    self._mark_failed(order_id=order_id, error=friendly_error)
+                    _console_print(f"[worker] order failed: strategy_id={strategy_id} pending_id={order_id} err={friendly_error}")
+                    _notify_live_best_effort(status="failed", error=friendly_error, amount_hint=amount, price_hint=ref_price)
+                    append_strategy_log(strategy_id, "error", f"Exchange order failed ({exchange_id} {symbol} {signal_type}): {friendly_error}")
                     return
             except Exception as e:
                 logger.warning(f"live market phase unexpected error: pending_id={order_id}, strategy_id={strategy_id}, cfg={safe_cfg}, err={e}")
@@ -2033,17 +2460,17 @@ class PendingOrderWorker:
             exchange_order_id = str(result.order_id or "")
 
             if avg_price <= 0 and ref_price > 0:
-                logger.warning(
-                    f"[worker] Alpaca order avg_price=0, using ref_price={ref_price} as fallback: "
-                    f"strategy_id={strategy_id} pending_id={order_id}"
-                )
-                avg_price = ref_price
-            if filled <= 0:
-                logger.warning(
-                    f"[worker] Alpaca order filled=0, using amount={amount} as fallback: "
-                    f"strategy_id={strategy_id} pending_id={order_id}"
-                )
-                filled = amount
+                if filled > 0:
+                    logger.warning(
+                        f"[worker] Alpaca order avg_price=0, using ref_price={ref_price} as fallback: "
+                        f"strategy_id={strategy_id} pending_id={order_id}"
+                    )
+                    avg_price = ref_price
+                else:
+                    logger.info(
+                        f"[worker] Alpaca order submitted but not filled yet: "
+                        f"strategy_id={strategy_id} pending_id={order_id} status={result.status}"
+                    )
 
             executed_at = int(time.time())
 
@@ -2081,6 +2508,11 @@ class PendingOrderWorker:
                     append_strategy_log(
                         strategy_id, "trade",
                         f"Trade executed: {signal_type} {symbol} filled={filled:.6f} @ {avg_price:.6f}{_pstr} (exchange=alpaca)",
+                    )
+                else:
+                    append_strategy_log(
+                        strategy_id, "info",
+                        f"Alpaca order submitted: {signal_type} {symbol} status={result.status or 'submitted'}, awaiting fill",
                     )
             except Exception as e:
                 logger.warning(f"Alpaca record_trade/update_position failed: pending_id={order_id}, err={e}")

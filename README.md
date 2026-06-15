@@ -416,6 +416,14 @@ IMAGE_TAG=3.0.22
 
 Tag resolution: `BACKEND_TAG` / `FRONTEND_TAG` → `IMAGE_TAG` → compose default (`latest`). Without a root `.env`, both compose files pull `ghcr.io/brokermr810/quantdinger-{backend,frontend}:latest`. Pin a specific release by setting `IMAGE_TAG` (lockstep) or `BACKEND_TAG` / `FRONTEND_TAG` (per-side) — see [GitHub Releases](https://github.com/brokermr810/QuantDinger/releases) for available tags.
 
+#### Version stamping
+
+Published backend images are stamped from the Git release tag automatically. A `v3.0.23` tag becomes `APP_VERSION=3.0.23`, which is what OpenAPI metadata and the UI brand config expose. Local source runs fall back to `git describe` and then the repo-root `VERSION` file; local Docker builds can override explicitly:
+
+```bash
+APP_VERSION=$(git describe --tags --abbrev=0 | sed 's/^v//') docker compose up -d --build backend
+```
+
 #### Alternative: build the frontend from Vue source
 
 If you have access to the **QuantDinger-Vue** repo and want to iterate on UI source (theme tweaks, forks, debugging) instead of pulling the published image, clone it into the `./QuantDinger-Vue/` slot at the repo root (gitignored) and let Compose build from there:
@@ -440,11 +448,25 @@ Default admin (change immediately in production):
 - **User**: `quantdinger`
 - **Password**: `123456` (from `env.example`; override with `ADMIN_USER` / `ADMIN_PASSWORD` in `.env` before first use if you prefer).
 
+If `ADMIN_PASSWORD` is set to any value other than `123456`, the bootstrap
+admin is treated as safely initialized and the first-login password reminder is
+not shown. If an existing database still stores the old default, startup syncs
+the first admin password to the non-default env value.
+
 Also set **`FRONTEND_URL`** in `backend_api_python/.env` to the URL users actually use (including `https://` behind a reverse proxy); it affects redirects, CORS-related settings, and some generated links.
 
 ### 6) Optional: enable AI features
 
 AI analysis, NL→code, and related flows need at least one LLM provider configured. Open `backend_api_python/env.example`, find the **AI / LLM** block, copy the relevant keys into your `.env` (for example `LLM_PROVIDER` + `OPENROUTER_API_KEY`, or another supported provider). Restart the backend after edits.
+
+AtlasCloud is also supported as an OpenAI-compatible provider. Use the official [AtlasCloud LLM API docs](https://www.atlascloud.ai/docs/models/llm) and [API key guide](https://www.atlascloud.ai/docs/api-keys), then configure:
+
+```env
+LLM_PROVIDER=atlascloud
+ATLASCLOUD_API_KEY=your_api_key
+ATLASCLOUD_MODEL=deepseek-v3
+ATLASCLOUD_BASE_URL=https://api.atlascloud.ai/v1
+```
 
 ### 7) Windows notes
 
@@ -519,11 +541,26 @@ df = df.copy()
 sma_short = df["close"].rolling(sma_short_period).mean()
 sma_long = df["close"].rolling(sma_long_period).mean()
 
-buy = (sma_short > sma_long) & (sma_short.shift(1) <= sma_long.shift(1))
-sell = (sma_short < sma_long) & (sma_short.shift(1) >= sma_long.shift(1))
+def edge(signal):
+    signal = signal.fillna(False).astype(bool)
+    return signal & ~signal.shift(1).fillna(False)
 
-df["buy"] = buy.fillna(False).astype(bool)
-df["sell"] = sell.fillna(False).astype(bool)
+open_long = (sma_short > sma_long) & (sma_short.shift(1) <= sma_long.shift(1))
+open_short = (sma_short < sma_long) & (sma_short.shift(1) >= sma_long.shift(1))
+
+df["open_long"] = edge(open_long)
+df["close_long"] = edge(open_short)
+df["open_short"] = edge(open_short)
+df["close_short"] = edge(open_long)
+
+output = {
+    "name": my_indicator_name,
+    "plots": [
+        {"name": "SMA Short", "data": sma_short.fillna(0).tolist(), "color": "#FF9800", "overlay": True},
+        {"name": "SMA Long", "data": sma_long.fillna(0).tolist(), "color": "#3F51B5", "overlay": True},
+    ],
+    "signals": [],
+}
 ```
 
 See full examples:
@@ -610,7 +647,7 @@ Use `backend_api_python/env.example` as the primary template. Key areas include:
 |------|----------|
 | Authentication | `SECRET_KEY`, `ADMIN_USER`, `ADMIN_PASSWORD` |
 | Database | `DATABASE_URL` |
-| LLM / AI | `LLM_PROVIDER`, `OPENROUTER_API_KEY`, `OPENAI_API_KEY` |
+| LLM / AI | `LLM_PROVIDER`, `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ATLASCLOUD_API_KEY` |
 | OAuth | `GOOGLE_CLIENT_ID`, `GITHUB_CLIENT_ID` |
 | Security | `TURNSTILE_SITE_KEY`, `ENABLE_REGISTRATION` |
 | Billing | `BILLING_ENABLED`, `BILLING_COST_AI_ANALYSIS` |

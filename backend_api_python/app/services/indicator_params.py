@@ -43,6 +43,10 @@ class StrategyConfigParser:
         r'#\s*@strategy\s+(\w+)\s*:?\s*(\S+)\s*(.*)',
         re.IGNORECASE
     )
+    CONTRACT_HEADER_PATTERN = re.compile(
+        r'\b(signal_form|exit_owner|flip_mode)\s*:?\s*(\S+)',
+        re.IGNORECASE
+    )
 
     VALID_KEYS = {
         'stopLossPct':          {'type': 'float', 'min': 0, 'max': 1},
@@ -53,6 +57,40 @@ class StrategyConfigParser:
         'trailingActivationPct':{'type': 'float', 'min': 0, 'max': 1},
         'tradeDirection':       {'type': 'str',   'enum': ['long', 'short', 'both']},
     }
+    VALID_EXIT_OWNERS = {'engine', 'indicator'}
+
+    @classmethod
+    def parse_contract_headers(cls, code: str) -> Dict[str, Any]:
+        """Parse optional indicator execution contract headers.
+
+        Supported examples:
+          # signal_form: four_way
+          # exit_owner: indicator
+          # flip_mode: R1
+
+        These are deliberately separate from ``# @strategy`` risk defaults so
+        an indicator can declare who owns exits without also forcing risk
+        values into the strategy config.
+        """
+        headers: Dict[str, Any] = {}
+        if not code:
+            return headers
+        for line in code.split('\n'):
+            line = line.strip()
+            if not line.startswith("#"):
+                continue
+            for m in cls.CONTRACT_HEADER_PATTERN.finditer(line[1:].strip()):
+                key = m.group(1).lower()
+                raw_val = str(m.group(2) or "").strip()
+                if key == "exit_owner":
+                    owner = raw_val.lower()
+                    if owner in cls.VALID_EXIT_OWNERS:
+                        headers["exit_owner"] = owner
+                elif key == "signal_form":
+                    headers["signal_form"] = raw_val.lower()
+                elif key == "flip_mode":
+                    headers["flip_mode"] = raw_val.upper()
+        return headers
 
     @classmethod
     def parse(cls, code: str) -> Dict[str, Any]:
@@ -121,26 +159,31 @@ class StrategyConfigParser:
         All *_Pct fields are 0–1 ratios (entryPct 1 = 100%, stopLossPct 0.15 = 15%).
         """
         parsed = cls.parse(code or "")
-        if not parsed:
+        headers = cls.parse_contract_headers(code or "")
+        if not parsed and not headers:
             return {}
 
-        trailing = {
-            "enabled": bool(parsed.get("trailingEnabled", False)),
-            "pct": float(parsed.get("trailingStopPct") or 0),
-            "activationPct": float(parsed.get("trailingActivationPct") or 0),
-        }
-        cfg: Dict[str, Any] = {
-            "risk": {
-                "stopLossPct": float(parsed.get("stopLossPct") or 0),
-                "takeProfitPct": float(parsed.get("takeProfitPct") or 0),
-                "trailing": trailing,
-            },
-            "position": {
-                "entryPct": cls.normalize_entry_ratio(parsed.get("entryPct")),
-            },
-        }
+        cfg: Dict[str, Any] = {}
+        if parsed:
+            trailing = {
+                "enabled": bool(parsed.get("trailingEnabled", False)),
+                "pct": float(parsed.get("trailingStopPct") or 0),
+                "activationPct": float(parsed.get("trailingActivationPct") or 0),
+            }
+            cfg.update({
+                "risk": {
+                    "stopLossPct": float(parsed.get("stopLossPct") or 0),
+                    "takeProfitPct": float(parsed.get("takeProfitPct") or 0),
+                    "trailing": trailing,
+                },
+                "position": {
+                    "entryPct": cls.normalize_entry_ratio(parsed.get("entryPct")),
+                },
+            })
         if parsed.get("tradeDirection"):
             cfg["tradeDirection"] = parsed["tradeDirection"]
+        if headers.get("exit_owner"):
+            cfg["exitOwner"] = headers["exit_owner"]
         return cfg
 
     @classmethod
@@ -163,7 +206,8 @@ class StrategyConfigParser:
         consumed by trading_executor._to_ratio() when code annotations are absent.
         """
         parsed = cls.parse(code or "")
-        if not parsed:
+        headers = cls.parse_contract_headers(code or "")
+        if not parsed and not headers:
             return {}
         out: Dict[str, Any] = {}
         if "stopLossPct" in parsed:
@@ -183,6 +227,8 @@ class StrategyConfigParser:
             out["entry_pct"] = min(100.0, max(0.01, cls.ratio_to_trading_config_percent(ep)))
         if "tradeDirection" in parsed:
             out["trade_direction"] = parsed["tradeDirection"]
+        if headers.get("exit_owner"):
+            out["exit_owner"] = headers["exit_owner"]
         return out
 
     @classmethod
