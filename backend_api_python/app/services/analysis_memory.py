@@ -19,6 +19,21 @@ from app.utils.db import get_db_connection
 logger = get_logger(__name__)
 
 
+def _iso_utc(dt) -> str | None:
+    """Convert a datetime to ISO-8601 UTC string with 'Z' suffix."""
+    if not dt:
+        return None
+    if hasattr(dt, 'isoformat'):
+        s = dt.isoformat()
+    elif isinstance(dt, str):
+        s = dt
+    else:
+        return str(dt)
+    if not s.endswith('Z') and '+' not in s.split('T')[-1]:
+        s += 'Z'
+    return s
+
+
 def _safe_json_parse(val, default=None):
     """安全解析 JSON - 处理已是 Python 对象或字符串的情况"""
     if val is None:
@@ -156,6 +171,13 @@ class AnalysisMemory:
                         ) THEN
                             ALTER TABLE qd_analysis_memory ADD COLUMN timeframe VARCHAR(10);
                         END IF;
+
+                        IF NOT EXISTS (
+                            SELECT 1 FROM information_schema.columns
+                            WHERE table_name = 'qd_analysis_memory' AND column_name = 'language'
+                        ) THEN
+                            ALTER TABLE qd_analysis_memory ADD COLUMN language VARCHAR(10) DEFAULT 'en-US';
+                        END IF;
                     END $$;
                 """)
                 
@@ -214,20 +236,23 @@ class AnalysisMemory:
                 agreement_ratio = consensus.get("agreement_ratio")
                 quality_multiplier = consensus.get("quality_multiplier")
                 
+                # language column (graceful: omit if column does not exist yet)
+                _lang = analysis_result.get('language') or 'en-US'
+
                 cur.execute("""
                     INSERT INTO qd_analysis_memory (
                         user_id, market, symbol, timeframe, decision, confidence,
                         price_at_analysis, summary, reasons, scores, indicators_snapshot, raw_result,
                         consensus_score, consensus_abs, agreement_ratio, quality_multiplier,
-                        task_status, task_error, updated_at
+                        task_status, task_error, language, updated_at
                     ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                              %s, %s, %s, %s, %s, %s, NOW())
+                              %s, %s, %s, %s, %s, %s, %s, NOW())
                     RETURNING id
                 """, (
                     user_id, market, symbol, timeframe, decision, confidence,
                     price, summary, reasons, scores, indicators, raw,
                     consensus_score, consensus_abs, agreement_ratio, quality_multiplier,
-                    "completed", "",
+                    "completed", "", _lang,
                 ))
                 
                 # 使用 lastrowid 属性获取 ID（execute 内部已经处理了 RETURNING）
@@ -286,8 +311,8 @@ class AnalysisMemory:
                     "full_result": _safe_json_parse(row.get('raw_result'), None),
                     "status": row.get('task_status') or 'completed',
                     "error_message": row.get('task_error') or '',
-                    "created_at": row['created_at'].isoformat() if row['created_at'] else None,
-                    "updated_at": row['updated_at'].isoformat() if row.get('updated_at') else None,
+                    "created_at": _iso_utc(row['created_at']),
+                    "updated_at": _iso_utc(row.get('updated_at')),
                     "was_correct": row['was_correct'],
                     "actual_return_pct": float(row['actual_return_pct']) if row['actual_return_pct'] else None,
                 }
@@ -341,8 +366,8 @@ class AnalysisMemory:
                         "scores": _safe_json_parse(row['scores'], {}),
                         "status": row.get('task_status') or 'completed',
                         "error_message": row.get('task_error') or '',
-                        "created_at": row['created_at'].isoformat() if row['created_at'] else None,
-                        "updated_at": row['updated_at'].isoformat() if row.get('updated_at') else None,
+                        "created_at": _iso_utc(row['created_at']),
+                        "updated_at": _iso_utc(row.get('updated_at')),
                         "was_correct": row['was_correct'],
                         "actual_return_pct": float(row['actual_return_pct']) if row['actual_return_pct'] else None,
                     })
@@ -413,8 +438,8 @@ class AnalysisMemory:
                         "full_result": _safe_json_parse(row['raw_result'], None),
                         "status": row.get('task_status') or 'completed',
                         "error_message": row.get('task_error') or '',
-                        "created_at": row['created_at'].isoformat() if row['created_at'] else None,
-                        "updated_at": row['updated_at'].isoformat() if row.get('updated_at') else None,
+                        "created_at": _iso_utc(row['created_at']),
+                        "updated_at": _iso_utc(row.get('updated_at')),
                         "was_correct": row['was_correct'],
                         "actual_return_pct": float(row['actual_return_pct']) if row['actual_return_pct'] else None,
                     })
@@ -479,15 +504,15 @@ class AnalysisMemory:
                     INSERT INTO qd_analysis_memory (
                         user_id, market, symbol, timeframe, decision, confidence,
                         summary, reasons, scores, indicators_snapshot, raw_result,
-                        task_status, task_error, updated_at, created_at
+                        task_status, task_error, language, updated_at, created_at
                     ) VALUES (%s, %s, %s, %s, %s, %s,
                               %s, %s, %s, %s, %s,
-                              %s, %s, NOW(), NOW())
+                              %s, %s, %s, NOW(), NOW())
                     RETURNING id
                 """, (
                     user_id, market, symbol, timeframe, "HOLD", 0,
                     summary, reasons, scores, indicators, raw,
-                    "pending", "",
+                    "pending", "", language or "en-US",
                 ))
                 # PostgresCursor.execute() 会在 INSERT 时提前 fetchone() 消耗 RETURNING 结果，
                 # 所以这里不要再 cur.fetchone()，直接取 lastrowid。

@@ -1490,16 +1490,38 @@ class MarketDataCollector:
         }
 
         payload = self._coinglass_get("/api/futures/coin/netflow", {"symbol": symbol}, ttl_sec=180)
-        latest = self._pick_latest_item(payload)
-        inflow = self._pick_number(latest or payload, "inflow", "inflowUsd", "inflow_usd")
-        outflow = self._pick_number(latest or payload, "outflow", "outflowUsd", "outflow_usd")
-        if inflow is not None and outflow is not None:
-            result["exchange_netflow"] = inflow - outflow
-            result["source"] = "coinglass"
-        else:
-            result["exchange_netflow"] = self._pick_number(latest or payload, "netflow", "netFlow", "net_flow")
-            if result["exchange_netflow"] is not None:
+        if payload is None:
+            logger.debug(f"[capital_flow] CoinGlass API returned None for {symbol}")
+        elif isinstance(payload, dict):
+            # CoinGlass v4: {"code":"0","msg":"success","data":{...},"success":true}
+            # The actual netflow fields are nested under payload.data with keys like
+            # net_flow_usd_24h, taker_buy_volume_usd_24h, taker_sell_volume_usd_24h
+            data = payload.get("data") or payload
+            netflow_24h = self._safe_num(data.get("net_flow_usd_24h"))
+            buy_vol_24h = self._safe_num(data.get("taker_buy_volume_usd_24h"))
+            sell_vol_24h = self._safe_num(data.get("taker_sell_volume_usd_24h"))
+            if netflow_24h is not None:
+                result["exchange_netflow"] = netflow_24h
                 result["source"] = "coinglass"
+                logger.debug(f"[capital_flow] {symbol} net_flow_usd_24h={netflow_24h}")
+            elif buy_vol_24h is not None and sell_vol_24h is not None:
+                result["exchange_netflow"] = buy_vol_24h - sell_vol_24h
+                result["source"] = "coinglass"
+                logger.debug(f"[capital_flow] {symbol} derived netflow from taker volumes: {buy_vol_24h - sell_vol_24h}")
+            else:
+                # Fallback: try legacy field names in case API format changes
+                latest = self._pick_latest_item(payload)
+                result["exchange_netflow"] = self._pick_number(
+                    latest or payload,
+                    "net_flow_usd_24h", "netflow", "netFlow", "net_flow",
+                )
+                if result["exchange_netflow"] is not None:
+                    result["source"] = "coinglass"
+                else:
+                    logger.warning(
+                        f"[capital_flow] CoinGlass: could not extract netflow for {symbol}. "
+                        f"data_keys={list(data.keys()) if isinstance(data, dict) else type(data).__name__}"
+                    )
 
         # CryptoQuant 稳定币净流先做可选增强；未配置时自然降级。
         payload = self._cryptoquant_get(

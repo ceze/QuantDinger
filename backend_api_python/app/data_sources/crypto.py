@@ -454,61 +454,83 @@ class CryptoDataSource(BaseDataSource):
             if mt in ("futures", "future", "perp", "perpetual"):
                 mt = "swap"
 
-            # Ephemeral client for public market data — no real keys needed.
-            client = KtxClient(
-                api_key="__placeholder__",
-                secret_key="__placeholder__",
-                market_type=mt,
-            )
-            raw_candles = client.get_kline(symbol=symbol, timeframe=timeframe, limit=limit)
-            if not raw_candles:
-                logger.warning(f"KTX get_kline returned no candles for {symbol} {timeframe}")
-                return []
+            # Try primary market_type first; if no candles, try the other
+            # (e.g. LAB/USDT not on spot but LAB_USDT_SWAP exists on swap/lpc).
+            market_types_to_try = [mt]
+            fallback_mt = "swap" if mt == "spot" else "spot"
+            market_types_to_try.append(fallback_mt)
 
-            # Normalize KTX candle response to the standard kline format.
-            # KTX candle fields: open_time (ms), open, high, low, close, volume (strings).
-            klines = []
-            for c in raw_candles:
-                try:
-                    ts = int(c.get("open_time", c.get("timestamp", 0)))
-                    if ts > 1e12:  # milliseconds → seconds
-                        ts = int(ts / 1000)
-                    o = float(c.get("open", 0) or 0)
-                    h = float(c.get("high", 0) or 0)
-                    l = float(c.get("low", 0) or 0)
-                    cl = float(c.get("close", 0) or 0)
-                    v = float(c.get("volume", c.get("vol", 0)) or 0)
-                    klines.append(self.format_kline(
-                        timestamp=ts,
-                        open_price=o,
-                        high=h,
-                        low=l,
-                        close=cl,
-                        volume=v,
-                    ))
-                except (ValueError, TypeError):
+            for try_mt in market_types_to_try:
+                # Ephemeral client for public market data — no real keys needed.
+                client = KtxClient(
+                    api_key="__placeholder__",
+                    secret_key="__placeholder__",
+                    market_type=try_mt,
+                )
+                raw_candles = client.get_kline(symbol=symbol, timeframe=timeframe, limit=limit)
+                if not raw_candles:
+                    if try_mt == market_types_to_try[0]:
+                        logger.warning(
+                            f"KTX get_kline returned no candles for {symbol} {timeframe} "
+                            f"(market_type={try_mt}), trying {fallback_mt} fallback"
+                        )
+                        continue
+                    else:
+                        logger.warning(
+                            f"KTX get_kline returned no candles for {symbol} {timeframe} "
+                            f"(market_type={try_mt} fallback also empty)"
+                        )
+                        return []
+
+                # Normalize KTX candle response to the standard kline format.
+                # KTX candle fields: open_time (ms), open, high, low, close, volume (strings).
+                klines = []
+                for c in raw_candles:
+                    try:
+                        ts = int(c.get("open_time", c.get("timestamp", 0)))
+                        if ts > 1e12:  # milliseconds → seconds
+                            ts = int(ts / 1000)
+                        o = float(c.get("open", 0) or 0)
+                        h = float(c.get("high", 0) or 0)
+                        l = float(c.get("low", 0) or 0)
+                        cl = float(c.get("close", 0) or 0)
+                        v = float(c.get("volume", c.get("vol", 0)) or 0)
+                        klines.append(self.format_kline(
+                            timestamp=ts,
+                            open_price=o,
+                            high=h,
+                            low=l,
+                            close=cl,
+                            volume=v,
+                        ))
+                    except (ValueError, TypeError):
+                        continue
+
+                if not klines and try_mt == market_types_to_try[0]:
                     continue
 
-            # Apply time filters and limit
-            klines = self.filter_and_limit(
-                klines, limit, before_time, after_time,
-                truncate=(after_time is None),
-            )
+                # Apply time filters and limit
+                klines = self.filter_and_limit(
+                    klines, limit, before_time, after_time,
+                    truncate=(after_time is None),
+                )
 
-            # Concise trace
-            if klines:
-                try:
-                    from datetime import datetime as _dt
-                    first_ts = _dt.utcfromtimestamp(klines[0]['time']).isoformat()
-                    last_ts = _dt.utcfromtimestamp(klines[-1]['time']).isoformat()
-                    logger.info(
-                        f"[CryptoKline] {symbol} {timeframe} returned {len(klines)} candles (KTX native), "
-                        f"utc_range={first_ts}~{last_ts}, limit={limit}, before_time={before_time}"
-                    )
-                except Exception:
-                    pass
+                # Concise trace
+                if klines:
+                    try:
+                        from datetime import datetime as _dt
+                        first_ts = _dt.utcfromtimestamp(klines[0]['time']).isoformat()
+                        last_ts = _dt.utcfromtimestamp(klines[-1]['time']).isoformat()
+                        logger.info(
+                            f"[CryptoKline] {symbol} {timeframe} returned {len(klines)} candles (KTX {try_mt}), "
+                            f"utc_range={first_ts}~{last_ts}, limit={limit}, before_time={before_time}"
+                        )
+                    except Exception:
+                        pass
 
-            return klines
+                return klines
+
+            return []
         except Exception as e:
             logger.error(f"KTX kline fetch failed for {symbol} {timeframe}: {e}")
             return []

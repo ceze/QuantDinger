@@ -59,36 +59,51 @@ def _cache_get(cache_key: str):
     Returns cached result dict on hit, None on miss.
     On L2 hit, backfills L1 for subsequent fast access.
     """
+    result = None
+    cache_source = None
+
     # L1: in-process dict (fastest)
     with _analysis_cache_lock:
         if cache_key in _analysis_result_cache:
             cached = _analysis_result_cache[cache_key]
             if time.time() - cached['timestamp'] < _ANALYSIS_CACHE_TTL:
-                return cached['result'], 'memory'
+                result = cached['result']
+                cache_source = 'memory'
             else:
                 del _analysis_result_cache[cache_key]
 
     # L2: Redis / CacheManager
-    cm = _get_cache_manager()
-    if cm is not None:
-        try:
-            redis_key = f"{_REDIS_CACHE_PREFIX}{cache_key}"
-            data = cm.get(redis_key)
-            if data and isinstance(data, dict):
-                result = data.get('result')
-                ts = data.get('timestamp', 0)
-                if result and time.time() - ts < _ANALYSIS_CACHE_TTL:
-                    # Backfill L1 for subsequent fast access
-                    with _analysis_cache_lock:
-                        _analysis_result_cache[cache_key] = {
-                            'result': result,
-                            'timestamp': ts
-                        }
-                    return result, 'redis'
-        except Exception as e:
-            logger.debug(f"L2 cache read failed for {cache_key}: {e}")
+    if result is None:
+        cm = _get_cache_manager()
+        if cm is not None:
+            try:
+                redis_key = f"{_REDIS_CACHE_PREFIX}{cache_key}"
+                data = cm.get(redis_key)
+                if data and isinstance(data, dict):
+                    _result = data.get('result')
+                    ts = data.get('timestamp', 0)
+                    if _result and time.time() - ts < _ANALYSIS_CACHE_TTL:
+                        # Backfill L1 for subsequent fast access
+                        with _analysis_cache_lock:
+                            _analysis_result_cache[cache_key] = {
+                                'result': _result,
+                                'timestamp': ts
+                            }
+                        result = _result
+                        cache_source = 'redis'
+            except Exception as e:
+                logger.debug(f"L2 cache read failed for {cache_key}: {e}")
 
-    return None, None
+    if result is not None:
+        # Ensure ISO-8601 UTC timestamps have 'Z' suffix
+        # (handles cached results from before the _iso_utc fix was deployed)
+        for _ts_key in ('created_at', 'updated_at'):
+            if _ts_key in result and isinstance(result[_ts_key], str):
+                _val = result[_ts_key]
+                if not _val.endswith('Z') and '+' not in _val.split('T')[-1]:
+                    result[_ts_key] = _val + 'Z'
+
+    return (result, cache_source) if result is not None else (None, None)
 
 
 def _cache_set(cache_key: str, result: dict):
@@ -118,6 +133,51 @@ def _cache_set(cache_key: str, result: dict):
     logger.info(f"Cached result to L1 only for {cache_key}")
 
 
+def _iso_utc(dt) -> str | None:
+    """Convert a datetime to ISO-8601 UTC string with 'Z' suffix."""
+    if not dt:
+        return None
+    if hasattr(dt, 'isoformat'):
+        s = dt.isoformat()
+    elif isinstance(dt, str):
+        s = dt
+    else:
+        return str(dt)
+    # Append 'Z' if timezone-aware (has +00:00 offset) or naive (assumed UTC)
+    if not s.endswith('Z') and '+' not in s.split('T')[-1]:
+        s += 'Z'
+    return s
+
+
+def _enrich_with_db_timestamps(result: dict) -> dict:
+    """Best-effort: add created_at/updated_at from DB by memory_id.
+
+    If the DB lookup fails, the result is returned unchanged.
+    The result dict is mutated in-place and also returned for convenience.
+    """
+    try:
+        memory_id = result.get('memory_id')
+        if not memory_id:
+            return result
+        from app.utils.db import get_db_connection
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute(
+                "SELECT created_at, updated_at FROM qd_analysis_memory WHERE id = %s",
+                (int(memory_id),)
+            )
+            row = cur.fetchone()
+            cur.close()
+            if row:
+                ca = row.get('created_at')
+                ua = row.get('updated_at')
+                result.setdefault('created_at', _iso_utc(ca))
+                result.setdefault('updated_at', _iso_utc(ua))
+    except Exception:
+        pass
+    return result
+
+
 def _try_refund_credits(user_id: int, amount: int, remark: str):
     """Best-effort async refund when task fails after pre-charge."""
     try:
@@ -145,57 +205,94 @@ def _db_get_recent_result(market: str, symbol: str, timeframe: str, max_age_minu
     L1/L2 caches miss (multi-worker gunicorn, Redis unavailable), the DB
     always has the truth.
     """
+    def _build_row(row, task_id, task_status, _created_at, _updated_at):
+        """Common row-to-dict extraction."""
+        _created_at = _iso_utc(_created_at)
+        _updated_at = _iso_utc(_updated_at)
+
+        if task_status in ('pending', 'processing'):
+            return {
+                'task_id': task_id,
+                'memory_id': task_id,
+                'task_status': 'pending',
+                'created_at': _created_at,
+                'updated_at': _updated_at,
+            }
+
+        raw = row['raw_result']
+        if raw and isinstance(raw, dict) and raw.get('decision'):
+            raw['_db_cached'] = True
+            raw['_memory_id'] = task_id
+            raw['task_status'] = 'completed'
+            raw.setdefault('created_at', _created_at)
+            raw.setdefault('updated_at', _updated_at)
+            return raw
+        return {
+            'decision': row['decision'],
+            'confidence': row['confidence'],
+            'price_at_analysis': float(row['price_at_analysis']) if row['price_at_analysis'] else None,
+            'summary': row['summary'],
+            'reasons': row['reasons'],
+            'scores': row['scores'],
+            'memory_id': task_id,
+            'task_status': 'completed',
+            '_db_cached': True,
+            'created_at': _created_at,
+            'updated_at': _updated_at,
+        }
+
     try:
         from app.utils.db import get_db_connection
         with get_db_connection() as db:
             cur = db.cursor()
-            cur.execute("""
-                SELECT id, task_status, decision, confidence, price_at_analysis,
-                       summary, reasons, scores,
-                       created_at, timeframe, raw_result
-                FROM qd_analysis_memory
-                WHERE market = %s AND symbol = %s AND (timeframe = %s OR timeframe IS NULL)
-                  AND (language = %s OR language IS NULL)
-                  AND task_status IN ('pending', 'processing', 'completed')
-                  AND created_at > NOW() - (%s || ' minutes')::interval
-                ORDER BY created_at DESC
-                LIMIT 1
-            """, (market.strip(), symbol.strip(), (timeframe or '1D').strip(),
-                   (language or 'en-US').strip(), int(max_age_minutes)))
+
+            # Try with language filter first (column may not exist in older schemas)
+            try:
+                cur.execute("""
+                    SELECT id, task_status, decision, confidence, price_at_analysis,
+                           summary, reasons, scores,
+                           created_at, updated_at, timeframe, raw_result
+                    FROM qd_analysis_memory
+                    WHERE market = %s AND symbol = %s AND (timeframe = %s OR timeframe IS NULL)
+                      AND (language = %s OR language IS NULL)
+                      AND task_status IN ('pending', 'processing', 'completed')
+                      AND created_at > NOW() - (%s || ' minutes')::interval
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                """, (market.strip(), symbol.strip(), (timeframe or '1D').strip(),
+                       (language or 'en-US').strip(), int(max_age_minutes)))
+            except Exception as lang_err:
+                # Fallback: language column may not exist yet — retry without it
+                if 'language' in str(lang_err).lower() or 'UndefinedColumn' in type(lang_err).__name__:
+                    logger.info("language column not found, retrying without language filter")
+                    cur.close()
+                    cur = db.cursor()
+                    cur.execute("""
+                        SELECT id, task_status, decision, confidence, price_at_analysis,
+                               summary, reasons, scores,
+                               created_at, updated_at, timeframe, raw_result
+                        FROM qd_analysis_memory
+                        WHERE market = %s AND symbol = %s AND (timeframe = %s OR timeframe IS NULL)
+                          AND task_status IN ('pending', 'processing', 'completed')
+                          AND created_at > NOW() - (%s || ' minutes')::interval
+                        ORDER BY created_at DESC
+                        LIMIT 1
+                    """, (market.strip(), symbol.strip(), (timeframe or '1D').strip(),
+                           int(max_age_minutes)))
+                else:
+                    raise
+
             row = cur.fetchone()
             if not row:
                 return None
 
-            task_id = row['id']
-            task_status = row['task_status']
-
-            # Pending/processing task — return task_id so the caller can return "submitted"
-            if task_status in ('pending', 'processing'):
-                return {
-                    'task_id': task_id,
-                    'memory_id': task_id,
-                    'task_status': 'pending',
-                }
-
-            # Completed task — return full result
-            raw = row['raw_result']
-            if raw and isinstance(raw, dict) and raw.get('decision'):
-                raw['_db_cached'] = True
-                raw['_memory_id'] = task_id
-                raw['task_status'] = 'completed'
-                return raw
-            # Fallback: reconstruct from columns
-            return {
-                'decision': row['decision'],
-                'confidence': row['confidence'],
-                'price_at_analysis': float(row['price_at_analysis']) if row['price_at_analysis'] else None,
-                'summary': row['summary'],
-                'reasons': row['reasons'],
-                'scores': row['scores'],
-                'memory_id': task_id,
-                'task_status': 'completed',
-                '_db_cached': True,
-            }
+            return _build_row(
+                row,
+                task_id=row['id'],
+                task_status=row['task_status'],
+                _created_at=row.get('created_at'),
+                _updated_at=row.get('updated_at'),
+            )
     except Exception as e:
         logger.warning(f"DB recent-result check failed: {e}", exc_info=True)
         return None
@@ -230,6 +327,7 @@ def _run_async_analysis_task(task_memory_id: int, market: str, symbol: str, lang
             )
         else:
             # Cache successful result to L1+L2 for subsequent requests
+            _enrich_with_db_timestamps(result)
             cache_key = _build_cache_key(market, symbol, timeframe, language)
             _cache_set(cache_key, result)
 
@@ -485,6 +583,7 @@ def analyze():
             }), 500
         
         # Cache the result to L1+L2 for other concurrent requests
+        _enrich_with_db_timestamps(result)
         _cache_set(cache_key, result)
         
         # memory_id is already set in service.analyze() -> _store_analysis_memory()
