@@ -46,6 +46,13 @@ def export_spec(output: Path, fmt: str) -> None:
 
     from app.openapi.register import enrich_spec
     spec_dict = enrich_spec(spec_dict)
+    # Runtime build/version metadata is intentionally excluded from the
+    # committed spec. CI exports from branch refs while release images export
+    # from tags, so keeping this field would make openapi.yaml drift even when
+    # the API surface has not changed.
+    info = spec_dict.get("info")
+    if isinstance(info, dict):
+        info.pop("x-api-app-version", None)
 
     output.parent.mkdir(parents=True, exist_ok=True)
 

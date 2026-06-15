@@ -92,11 +92,12 @@ Each strategy **MUST** declare one owner in comments or docs:
 
 | Mode | Script | `# @strategy` |
 |------|--------|---------------|
-| **Indicator exits** | `close_*` | `trailingEnabled false` |
-| **Engine exits** | `open_*` only | SL/TP/trailing as needed |
-| **Layered** | Document priority | Wide engine stop as backup only |
+| **Indicator exits** `exit_owner: indicator` | `close_*` or equivalent explicit signal exits | `trailingEnabled false`; do not rely on SL/TP/trailing |
+| **Engine exits** `exit_owner: engine` | entries only, or structural reverse `close_*` signals | SL/TP/trailing as needed |
 
 **MUST NOT** combine tight indicator tp/sl with tight `trailingEnabled` on the same leg.
+
+The current backend supports only `exit_owner: indicator` and `exit_owner: engine`. Do not emit `exit_owner: layered`; a mixed “indicator exits + engine backup” mode needs an explicit product/runtime change first.
 
 ---
 

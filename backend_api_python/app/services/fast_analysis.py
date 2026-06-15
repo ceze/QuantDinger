@@ -1040,8 +1040,21 @@ IMPORTANT:
                 }
                 decision_votes[decision] = decision_votes.get(decision, 0) + 1
 
-                # Weight by strength so strong cycles dominate
-                w = 1.0 + min(1.5, abs_score / 100.0)
+                # Weight by timeframe and strength. Longer frames should anchor
+                # regime direction; short-frame oversold bounces must not
+                # dominate a 1D/1W downtrend.
+                tf_base_weights = {
+                    "1M": 0.75,
+                    "3M": 0.75,
+                    "5M": 0.80,
+                    "15M": 0.85,
+                    "30M": 0.90,
+                    "1H": 0.95,
+                    "4H": 1.10,
+                    "1D": 1.30,
+                    "1W": 1.35,
+                }
+                w = float(tf_base_weights.get(tf_norm, 1.0)) * (1.0 + min(1.0, abs_score / 100.0))
                 weighted_score_sum += overall_score * w
                 weighted_score_w_sum += w
 
@@ -1238,6 +1251,15 @@ IMPORTANT:
             score_1w = float((objective_by_tf.get("1W") or {}).get("overall_score", score_1d) or score_1d)
             score_3d = score_1d * 0.7 + score_4h * 0.3
             score_1m = score_1w * 0.55 + float(objective_score.get("fundamental_score", 0.0)) * 0.30 + float(objective_score.get("macro_score", 0.0)) * 0.15
+            horizon_risk = self._technical_risk_context(data.get("indicators") or {}, data.get("price") or {})
+            if horizon_risk.get("panic_breakdown"):
+                score_24h = min(score_24h, -20.0)
+                score_3d = min(score_3d, -10.0)
+                score_1w = min(score_1w, 0.0)
+                score_1m = min(score_1m, 10.0)
+            elif horizon_risk.get("bearish_context") and horizon_risk.get("change_24h", 0.0) <= -3.0:
+                score_24h = min(score_24h, 5.0)
+                score_3d = min(score_3d, 10.0)
 
             def _trend_strength(score_val: float) -> str:
                 a = abs(float(score_val))
@@ -1284,8 +1306,15 @@ IMPORTANT:
             min_abs_override = float(cfg.get("min_consensus_abs_override") or 15.0)
             quality_hold_thr = float(cfg.get("quality_hold_threshold") or 0.7)
             regime = self._detect_market_regime(data.get("indicators") or {})
+            risk_context = self._technical_risk_context(data.get("indicators") or {}, data.get("price") or {})
             if regime == "ranging":
                 min_abs_override *= 1.2
+            if (
+                consensus_decision == "BUY"
+                and llm_decision in ("SELL", "HOLD")
+                and (risk_context.get("panic_breakdown") or risk_context.get("bearish_context"))
+            ):
+                min_abs_override = max(min_abs_override, 55.0 if risk_context.get("panic_breakdown") else 40.0)
 
             if consensus_abs >= min_abs_override:
                 final_decision = consensus_decision
@@ -1338,6 +1367,7 @@ IMPORTANT:
                 "agreement_ratio": agreement_ratio,
                 "quality_multiplier": quality_multiplier,
                 "market_regime": regime,
+                "risk_context": risk_context,
             }
             
             # Phase 5: Validate and constrain output (pass indicators for decision validation)
@@ -1469,6 +1499,8 @@ IMPORTANT:
         强调SELL信号是有效的做空机会。
         """
         guidance_parts = []
+        ma_trend_low = str(ma_trend or "").lower()
+        bearish_guidance_context = bool("downtrend" in ma_trend_low or macd_signal == "bearish")
         
         # RSI 指导 - 更积极地识别做空机会
         if rsi_value > 70:
@@ -1515,11 +1547,15 @@ IMPORTANT:
             change_24h > 5
         ])
         buy_signals = sum([
-            rsi_value < 40,
+            (rsi_value < 40 and not bearish_guidance_context),
             macd_signal == "bullish",
-            "uptrend" in ma_trend.lower(),
-            change_24h < -5
+            "uptrend" in ma_trend_low,
+            (change_24h < -5 and not bearish_guidance_context)
         ])
+        if bearish_guidance_context and (rsi_value < 40 or change_24h < -5):
+            guidance_parts.append(
+                "Risk context: oversold RSI / sharp drop appears inside a bearish trend; treat it as continuation risk until reversal confirmation."
+            )
         
         if sell_signals >= 2:
             guidance_parts.append(f"📊 综合判断: {sell_signals}个做空信号，建议考虑SELL")
@@ -2000,11 +2036,53 @@ IMPORTANT:
         self._calibration_cache[key] = cfg
         self._calibration_cache_ts[key] = now
         return cfg
+
+    def _technical_risk_context(self, indicators: Dict, price_data: Dict) -> Dict[str, Any]:
+        """Classify whether oversold signals are likely reversal or breakdown risk."""
+        indicators = indicators or {}
+        price_data = price_data or {}
+        ma = indicators.get("moving_averages") or {}
+        macd = indicators.get("macd") or {}
+        trend = str(ma.get("trend") or indicators.get("trend") or "sideways").lower()
+        macd_signal = str(macd.get("signal") or "neutral").lower()
+        try:
+            change_24h = float(price_data.get("changePercent") or 0.0)
+        except Exception:
+            change_24h = 0.0
+        try:
+            volume_ratio = float(indicators.get("volume_ratio") or 1.0)
+        except Exception:
+            volume_ratio = 1.0
+        try:
+            rsi_value = float((indicators.get("rsi") or {}).get("value") or 50.0)
+        except Exception:
+            rsi_value = 50.0
+
+        strong_downtrend = "strong_downtrend" in trend
+        downtrend = "downtrend" in trend
+        bearish_context = bool(downtrend or macd_signal == "bearish")
+        panic_breakdown = bool(
+            (strong_downtrend and macd_signal == "bearish" and change_24h <= -3.0)
+            or (downtrend and macd_signal == "bearish" and change_24h <= -5.0)
+            or (change_24h <= -8.0 and volume_ratio >= 1.3)
+        )
+        return {
+            "trend": trend,
+            "macd_signal": macd_signal,
+            "rsi": rsi_value,
+            "change_24h": change_24h,
+            "volume_ratio": volume_ratio,
+            "downtrend": downtrend,
+            "strong_downtrend": strong_downtrend,
+            "bearish_context": bearish_context,
+            "panic_breakdown": panic_breakdown,
+        }
     
     def _calculate_technical_score(self, indicators: Dict, price_data: Dict) -> float:
         """计算技术指标评分 (-100 to +100)"""
         score = 0.0
         weight_sum = 0.0
+        risk = self._technical_risk_context(indicators, price_data)
         
         # RSI 评分 (-50 to +50)
         rsi_data = indicators.get("rsi", {})
@@ -2020,6 +2098,13 @@ IMPORTANT:
                 rsi_score = +30  # 偏超卖，利多
             else:
                 rsi_score = (50 - rsi_value) * 0.6  # 40-60之间，线性映射
+            if rsi_value < 30:
+                if risk.get("panic_breakdown"):
+                    rsi_score = -10
+                elif risk.get("bearish_context"):
+                    rsi_score = min(rsi_score, 8)
+            elif rsi_value < 40 and risk.get("bearish_context"):
+                rsi_score = min(rsi_score, 6)
             score += rsi_score * 0.30
             weight_sum += 0.30
         
@@ -2063,6 +2148,10 @@ IMPORTANT:
             change_score = +10
         else:
             change_score = change_24h * 2  # 线性映射
+        if change_24h < -10:
+            change_score = -20 if risk.get("panic_breakdown") else (min(change_score, 5) if risk.get("bearish_context") else change_score)
+        elif change_24h < -5:
+            change_score = -10 if risk.get("panic_breakdown") else (min(change_score, 3) if risk.get("bearish_context") else change_score)
         score += change_score * 0.20
         weight_sum += 0.20
 
@@ -2085,6 +2174,10 @@ IMPORTANT:
                 pp_score -= 5
             elif pp <= 15:
                 pp_score += 5
+            if risk.get("bearish_context") and pp <= 20:
+                pp_score = min(pp_score, 3)
+            if risk.get("panic_breakdown") and pp <= 20:
+                pp_score = min(pp_score, -3)
             extra_score += pp_score
             extra_weight += 0.20
         except Exception:
@@ -2101,7 +2194,7 @@ IMPORTANT:
                     extra_score += -12
                     extra_weight += 0.20
                 elif cur_px <= bb_l:
-                    extra_score += +12
+                    extra_score += (-6 if risk.get("panic_breakdown") else (0 if risk.get("bearish_context") else +12))
                     extra_weight += 0.20
                 else:
                     # Within bands: small contribution by relative position
@@ -2120,7 +2213,7 @@ IMPORTANT:
                     extra_score += +8
                     extra_weight += 0.15
                 elif "downtrend" in trend:
-                    extra_score += -8
+                    extra_score += (-16 if risk.get("change_24h", 0.0) < 0 else -8)
                     extra_weight += 0.15
                 else:
                     # 放量但无趋势：更偏不确定，略微降低（当作偏利空风险）
@@ -2156,7 +2249,11 @@ IMPORTANT:
         
         # 归一化到-100到+100
         if weight_sum > 0:
-            score = score / weight_sum * 100
+            score = score / max(1.0, weight_sum)
+        if risk.get("panic_breakdown"):
+            score = min(score, -25.0)
+        elif risk.get("bearish_context") and risk.get("change_24h", 0.0) <= -3.0:
+            score = min(score, 5.0)
         
         return max(-100, min(100, score))
     

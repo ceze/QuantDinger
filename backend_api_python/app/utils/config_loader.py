@@ -89,6 +89,11 @@ def load_addon_config() -> Dict[str, Any]:
         ('GROK_BASE_URL', 'grok.base_url', 'string'),
         ('GROK_MODEL', 'grok.model', 'string'),
 
+        # AtlasCloud
+        ('ATLASCLOUD_API_KEY', 'atlascloud.api_key', 'string'),
+        ('ATLASCLOUD_BASE_URL', 'atlascloud.base_url', 'string'),
+        ('ATLASCLOUD_MODEL', 'atlascloud.model', 'string'),
+
         # Custom OpenAI-compatible endpoint (see LLMProvider.CUSTOM)
         ('CUSTOM_API_KEY', 'custom.api_key', 'string'),
         ('CUSTOM_API_URL', 'custom.base_url', 'string'),

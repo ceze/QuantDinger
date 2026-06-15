@@ -272,6 +272,24 @@ def _validate_indicator_code_internal(code: str, user_params: Dict[str, Any] | N
                 "hints": hints,
             }
 
+    executed_df = exec_env.get('df', df)
+    four_way_cols = ['open_long', 'close_long', 'open_short', 'close_short']
+    has_four_way = all(col in getattr(executed_df, "columns", []) for col in four_way_cols)
+    if not has_four_way:
+        return {
+            "success": False,
+            "msg": (
+                "Missing execution columns. New QuantDinger indicator scripts must define "
+                "df['open_long'], df['close_long'], df['open_short'], and df['close_short'] "
+                "as boolean columns. output['signals'] is chart-only and cannot place orders."
+            ),
+            "error_type": "MissingExecutionColumns",
+            "details": None,
+            "plots_count": len(plots),
+            "signals_count": len(signals),
+            "hints": hints,
+        }
+
     return {
         "success": True,
         "msg": "Verification passed! Code executed successfully.",
@@ -343,12 +361,12 @@ def _indicator_hint_to_text(hint_code: str, params: Dict[str, Any] | None = None
         return "缺少 output 字典。" if is_zh else "Missing output dictionary."
     if hint_code == "MISSING_BUY_SELL_COLUMNS":
         return (
-            "缺少执行信号列：请提供四路 open_long/close_long/open_short/close_short，"
-            "或两路 buy/sell。"
+            "缺少执行信号列：请提供四路 open_long/close_long/open_short/close_short；"
+            "output['signals'] 只负责图表标记，不能用于下单。"
             if is_zh
             else
-            "Missing execution columns: provide four-way open_long/close_long/open_short/close_short "
-            "or two-way buy/sell."
+            "Missing execution columns: provide four-way open_long/close_long/open_short/close_short. "
+            "output['signals'] is chart-only and cannot place orders."
         )
     if hint_code == "MISSING_DF_COPY":
         return "缺少 df = df.copy()。" if is_zh else "Missing df = df.copy()."
@@ -639,6 +657,7 @@ def save_indicator():
                     # 如果之前未发布，现在发布，设置审核状态
                     # 管理员发布的直接通过，普通用户需要待审核
                     new_review_status = 'approved' if is_admin else 'pending'
+                    reviewer_id = user_id if is_admin else None
                     if not was_published:
                         cur.execute(
                             """
@@ -646,25 +665,31 @@ def save_indicator():
                             SET name = ?, code = ?, description = ?,
                                 publish_to_community = ?, pricing_type = ?, price = ?, preview_image = ?,
                                 vip_free = ?, asset_type = ?,
-                                review_status = ?, review_note = '', reviewed_at = NOW(), reviewed_by = ?,
+                                review_status = ?, review_note = '',
+                                reviewed_at = CASE WHEN ? = 'approved' THEN NOW() ELSE NULL END,
+                                reviewed_by = ?,
                                 updatetime = ?, updated_at = NOW()
                             WHERE id = ? AND user_id = ? AND (is_buy IS NULL OR is_buy = 0)
                             """,
                             (name, code, description, publish_to_community, pricing_type, price, preview_image, vip_free, asset_type,
-                             new_review_status, user_id if is_admin else None, now, indicator_id, user_id),
+                             new_review_status, new_review_status, reviewer_id, now, indicator_id, user_id),
                         )
                     else:
-                        # 已发布过的更新，保持原审核状态
+                        # Non-admin updates to published assets require review again.
                         cur.execute(
                             """
                             UPDATE qd_indicator_codes
                             SET name = ?, code = ?, description = ?,
                                 publish_to_community = ?, pricing_type = ?, price = ?, preview_image = ?,
                                 vip_free = ?, asset_type = ?,
+                                review_status = ?, review_note = '',
+                                reviewed_at = CASE WHEN ? = 'approved' THEN NOW() ELSE NULL END,
+                                reviewed_by = ?,
                                 updatetime = ?, updated_at = NOW()
                             WHERE id = ? AND user_id = ? AND (is_buy IS NULL OR is_buy = 0)
                             """,
-                            (name, code, description, publish_to_community, pricing_type, price, preview_image, vip_free, asset_type, now, indicator_id, user_id),
+                            (name, code, description, publish_to_community, pricing_type, price, preview_image, vip_free, asset_type,
+                             new_review_status, new_review_status, reviewer_id, now, indicator_id, user_id),
                         )
                 else:
                     # 取消发布，清除审核状态
@@ -903,25 +928,35 @@ Self-check before returning code: every place where you call `.rolling` / `.fill
 
 # Backtest contract (strict)
 
-**Preferred (platform default): four-way execution columns**
+**Required (platform default): four-way execution columns**
 
 - `df['open_long']`, `df['close_long']`, `df['open_short']`, `df['close_short']` — all bool, length `len(df)`.
 - Use an `edge(s)` helper: `s & ~s.shift(1).fillna(False)` on each raw condition.
 - On trend flip bars you MAY set both `close_*` and opposing `open_*` true (flip_mode R2); for tp/sl-only exits use `close_*` alone without mixing tp/sl into `buy`/`sell`.
 - Declare contract header comments: `# signal_form: four_way`, `# exit_owner: engine|indicator`, `# flip_mode: R1|R2`.
+- Supported exit owners are **only** `engine` and `indicator`. Never emit `exit_owner: layered`.
 - See `docs/SIGNAL_EXECUTION_STANDARD_CN.md`.
 
-**Legacy two-way** (simple crossover only):
+Do not generate legacy `df['buy']` / `df['sell']` columns for new code. Existing
+user code may contain those names, but generated or repaired scripts must
+migrate to four-way execution columns.
 
-- `df['buy']` / `df['sell']` — edge-triggered; `tradeDirection both` maps buy→open long (flip short first), sell→open short (flip long first). Do **not** use buy/sell for “close only” exits when `both` — use four-way `close_*`.
-
-Rules (both forms):
+Rules:
 
 - Same **index and length** as `df`; dtype boolean (use `.astype(bool)` after fillna).
 - **Edge-trigger (mandatory)** unless the user explicitly asks for repeated signals on consecutive bars.
 - Signals represent **confirmation on bar close**; the engine fills on the **next bar open** (live-like). Do not implement intrabar lookahead unless the user clearly wants research mode.
 - Fill NaN from indicators before comparisons; replace division-by-zero (`replace(0, np.nan)` then fill).
-- If you use four-way columns, you do **not** need `df['buy']`/`df['sell']` unless `output['signals']` chart markers require them (markers can use open_long/open_short only).
+- `df['buy']` / `df['sell']` are legacy-only and should not appear in new generated code.
+
+# Exit ownership (strict)
+
+Pick exactly one price-exit owner and make the code consistent:
+
+- Use `# exit_owner: indicator` when the code itself emits close-only exits (`close_long` / `close_short`) for TP/SL, middle-band touches, channel exits, trailing logic, or other price/risk exits. In this mode set `# @strategy trailingEnabled false` and do not rely on `stopLossPct`, `takeProfitPct`, or trailing fields; the backend disables server-side price exits in backtest/live.
+- Use `# exit_owner: engine` when fixed stop-loss, fixed take-profit, or trailing stop should be handled by `# @strategy`. In this mode code should focus on entries; structural reverse `close_*` signals are acceptable, but do **not** encode a second tight TP/SL system in indicator booleans.
+- If the user asks for touch-based TP/SL, channel/middle-band exits, or in-code trailing, prefer `exit_owner: indicator`.
+- If the user asks for simple entry signals plus fixed SL/TP/trailing defaults, prefer `exit_owner: engine`.
 
 # Chart output: `output` dict (strict)
 
@@ -975,7 +1010,7 @@ Supported keys (parser-enforced):
 - `trailingStopPct`, `trailingActivationPct`: float **0–1** = price retracement / activation thresholds (same basis as stop/take-profit).
 - `tradeDirection`: exactly `long`, `short`, or `both`.
 
-**`tradeDirection both` execution semantics:** `df['buy']` → open long (close short first if short); `df['sell']` → open short (close long first if long). Do not document `buy` as a separate close-short column. If the strategy uses in-code tp/sl on `high`/`low` touches, prefer **not** also setting `trailingEnabled true` unless the user explicitly wants engine trailing — see `docs/STRATEGY_DEV_GUIDE.md`.
+**`tradeDirection both` execution semantics:** use four-way columns. `open_long` opens long (closing short first if needed), `open_short` opens short (closing long first if needed), and `close_long` / `close_short` are close-only exits. Do not document legacy `buy` / `sell` as close-only columns. If the strategy uses in-code tp/sl on `high`/`low` touches, use `close_*`, declare `# exit_owner: indicator`, and keep `# @strategy trailingEnabled false` unless the user explicitly asks for engine-managed exits — see `docs/STRATEGY_DEV_GUIDE.md`.
 
 **Do not** put `leverage` in `@strategy`; users set leverage in the IDE backtest panel.
 
@@ -986,14 +1021,15 @@ Pick defaults that match the strategy style (trend vs mean-reversion).
 # Quality bar
 
 - Prefer clear variable names, short comments only where non-obvious.
-- Ensure at least some `buy` and some `sell` True in typical ranges unless the user asked for a rare signal; if logic is too strict, widen thresholds.
-- If the user asks for “display only” with no trading, still set `df['buy']`/`df['sell']` to all-False and provide plots.
+- Ensure at least some `open_long` and/or `open_short` True in typical ranges unless the user asked for a rare signal; if logic is too strict, widen thresholds.
+- If the user asks for “display only” with no trading, still set all four-way execution columns to all-False and provide plots.
 - For signal markers, prefer explicit lists with `None` for empty bars:
-  - `buy_marks = [df['low'].iloc[i] * 0.995 if bool(df['buy'].iloc[i]) else None for i in range(len(df))]`
+  - `buy_marks = [df['low'].iloc[i] * 0.995 if bool(df['open_long'].iloc[i]) else None for i in range(len(df))]`
+  - `sell_marks = [df['high'].iloc[i] * 1.005 if bool(df['open_short'].iloc[i]) else None for i in range(len(df))]`
   - Avoid `series.where(mask, None).tolist()` for marker data because float series may still contain `NaN` instead of real `None`.
 - Before returning code, self-check:
   1. every declared `# @param` used in code is read via `params.get(...)`
-  2. `df['buy']` and `df['sell']` are assigned boolean Series
+  2. `df['open_long']`, `df['close_long']`, `df['open_short']`, and `df['close_short']` are assigned boolean Series
   3. every `plot['data']` and `signal['data']` length equals `len(df)`
   4. `output` exists and is a dict
   5. **type audit**: scan every `.rolling` / `.fillna` / `.shift` / `.ewm` / `.iloc` / `.tolist` call site; confirm its left-hand side is a Series. If it came from `np.where` / `np.maximum` / `np.minimum` / a custom helper returning ndarray, you MUST wrap with `pd.Series(arr, index=df.index)` first
@@ -1001,7 +1037,7 @@ Pick defaults that match the strategy style (trend vs mean-reversion).
 
 # Output format for this chat turn
 
-Return **only** valid Python source: **no** markdown fences, **no** ` ``` `, **no** explanation before or after the code. First non-empty line should be `my_indicator_name` or a comment block with `@strategy`/`@param` immediately followed by `my_indicator_name`.
+Return **only** valid Python source: **no** markdown fences, **no** ` ``` `, **no** explanation before or after the code. First non-empty line should be `my_indicator_name` or a short contract/comment block (`signal_form` / `exit_owner` / `flip_mode` / `@strategy` / `@param`) immediately followed by `my_indicator_name`.
 """
 
     def _template_code() -> str:
@@ -1044,11 +1080,11 @@ Return **only** valid Python source: **no** markdown fences, **no** ` ``` `, **n
         user_prompt = prompt
         if existing:
             user_prompt = (
-                "# Existing QuantDinger indicator code (keep working output/buy/sell contract):\n\n```python\n"
+                "# Existing QuantDinger indicator code (migrate it to the four-way execution contract):\n\n```python\n"
                 + existing.strip()
                 + "\n```\n\n# Change request:\n\n"
                 + prompt
-                + "\n\nReturn one full replacement script: same QuantDinger rules (my_indicator_name/description, df = df.copy(), declared @param values must be read via params.get(...), four-way OR buy/sell execution columns, output dict, list lengths == len(df)). "
+                + "\n\nReturn one full replacement script: same QuantDinger rules (my_indicator_name/description, df = df.copy(), declared @param values must be read via params.get(...), four-way execution columns, output dict, list lengths == len(df)). "
                 "Python only — no markdown, no prose outside the code."
             )
 
@@ -1133,7 +1169,7 @@ Return **only** valid Python source: **no** markdown fences, **no** ` ``` `, **n
             "# Repair requirements\n"
             "- Keep QuantDinger indicator contract intact.\n"
             "- If code declares # @param, read each declared param via params.get(...).\n"
-            "- Ensure df['buy'] and df['sell'] are boolean Series.\n"
+            "- Ensure df['open_long'], df['close_long'], df['open_short'], and df['close_short'] are boolean Series.\n"
             "- Ensure output exists and all plot/signal data lengths equal len(df).\n"
             "- For signal markers, prefer explicit None-or-price lists, not .where(..., None).tolist().\n"
             "- **Series vs ndarray**: audit every `.rolling` / `.fillna` / `.shift` / `.ewm` / `.iloc` / `.tolist` call. "

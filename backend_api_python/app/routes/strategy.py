@@ -4,7 +4,7 @@ Trading Strategy API Routes
 from flask import g, jsonify, request
 from app.openapi.blueprint import HumanBlueprint as Blueprint
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Dict, List, Optional, Tuple
 import json
 import re
 import traceback
@@ -13,6 +13,7 @@ import time
 from app.services.strategy import StrategyService
 from app.services.strategy_compiler import StrategyCompiler
 from app.services.backtest import BacktestService
+from app.services.backtest_limits import validate_backtest_range
 from app.services.strategy_snapshot import StrategySnapshotResolver
 from app import get_trading_executor
 from app.utils.logger import get_logger
@@ -35,6 +36,102 @@ from app.utils.pnl import (
 logger = get_logger(__name__)
 
 strategy_blp = Blueprint('strategy', __name__)
+
+
+def _strategy_live_lock_key(strategy: Dict[str, Any], user_id: int) -> Optional[Tuple[Any, ...]]:
+    """Return the account/symbol key that cannot run twice for live strategies."""
+    execution_mode = str(strategy.get("execution_mode") or "signal").strip().lower()
+    if execution_mode != "live":
+        return None
+
+    trading_config = strategy.get("trading_config") if isinstance(strategy.get("trading_config"), dict) else {}
+    exchange_config = strategy.get("exchange_config") if isinstance(strategy.get("exchange_config"), dict) else {}
+
+    try:
+        from app.services.exchange_execution import resolve_exchange_config
+        from app.services.live_trading.leg_context import credential_id_from_exchange_config
+        from app.services.live_trading.records import normalize_strategy_symbol
+
+        resolved_exchange = resolve_exchange_config(exchange_config, user_id=int(user_id or strategy.get("user_id") or 1))
+        exchange_id = str(
+            resolved_exchange.get("exchange_id")
+            or exchange_config.get("exchange_id")
+            or ""
+        ).strip().lower()
+        if not exchange_id:
+            return None
+
+        credential_id = int(credential_id_from_exchange_config(resolved_exchange) or credential_id_from_exchange_config(exchange_config) or 0)
+        credential_key: Any = credential_id if credential_id > 0 else f"inline:{exchange_id}"
+
+        market_type = str(
+            trading_config.get("market_type")
+            or strategy.get("market_type")
+            or resolved_exchange.get("market_type")
+            or "swap"
+        ).strip().lower()
+        if market_type in ("futures", "future", "perp", "perpetual"):
+            market_type = "swap"
+
+        symbol = (
+            strategy.get("symbol")
+            or trading_config.get("symbol")
+            or ""
+        )
+        symbol = normalize_strategy_symbol(str(symbol or "").strip()).upper()
+        if not symbol:
+            return None
+
+        return (int(user_id or strategy.get("user_id") or 0), credential_key, exchange_id, market_type, symbol)
+    except Exception as e:
+        logger.warning("strategy live lock key failed for strategy %s: %s", strategy.get("id"), e)
+        return None
+
+
+def _find_live_strategy_conflict(strategy: Dict[str, Any], user_id: int) -> Optional[Dict[str, Any]]:
+    """Find another running live strategy using the same account + market + symbol."""
+    key = _strategy_live_lock_key(strategy, user_id)
+    if not key:
+        return None
+    sid = int(strategy.get("id") or 0)
+    with get_db_connection() as db:
+        cur = db.cursor()
+        cur.execute(
+            """
+            SELECT id
+            FROM qd_strategies_trading
+            WHERE user_id = ? AND status = 'running' AND execution_mode = 'live' AND id <> ?
+            """,
+            (int(user_id), sid),
+        )
+        rows = cur.fetchall() or []
+        cur.close()
+
+    service = get_strategy_service()
+    for row in rows:
+        other_id = int(row.get("id") or 0)
+        other = service.get_strategy(other_id, user_id=user_id)
+        if not other:
+            continue
+        if _strategy_live_lock_key(other, user_id) == key:
+            return {
+                "strategy_id": other_id,
+                "strategy_name": other.get("strategy_name") or other.get("name") or str(other_id),
+                "symbol": key[-1],
+                "market_type": key[-2],
+                "exchange_id": key[-3],
+            }
+    return None
+
+
+def _live_conflict_message(conflict: Dict[str, Any]) -> str:
+    return (
+        "Live strategy conflict: another running strategy already uses the same "
+        f"API key/exchange/market/symbol ({conflict.get('exchange_id')} "
+        f"{conflict.get('market_type')} {conflict.get('symbol')}). "
+        f"Please stop strategy {conflict.get('strategy_id')} "
+        f"({conflict.get('strategy_name')}) first."
+    )
 
 
 def _normalize_trade_row_for_api(trade: dict, *, leverage: float = 1.0, market_type: str = "spot") -> dict:
@@ -370,28 +467,29 @@ def run_strategy_backtest():
         start_date = datetime.strptime(start_date_str, '%Y-%m-%d')
         end_date = datetime.strptime(end_date_str, '%Y-%m-%d').replace(hour=23, minute=59, second=59)
 
-        days_diff = (end_date - start_date).days
         timeframe = snapshot.get('timeframe') or '1D'
-        if timeframe == '1m':
-            max_days = 30
-            max_range_text = '1 month'
-        elif timeframe == '5m':
-            max_days = 180
-            max_range_text = '6 months'
-        elif timeframe in ['15m', '30m']:
-            max_days = 365
-            max_range_text = '1 year'
-        else:
-            max_days = 1095
-            max_range_text = '3 years'
-        if days_diff > max_days:
+        svc = get_backtest_service()
+        warmup_bars = svc._estimate_warmup_bars(
+            snapshot.get('code') or '',
+            (snapshot.get('strategy_config') or {}).get('indicator_params')
+            if isinstance(snapshot.get('strategy_config'), dict)
+            else None,
+        )
+        range_error = validate_backtest_range(
+            market=snapshot.get('market') or '',
+            symbol=snapshot.get('symbol') or '',
+            timeframe=timeframe,
+            start_date=start_date,
+            end_date=end_date,
+            warmup_bars=warmup_bars,
+        )
+        if range_error:
             return jsonify({
                 'code': 0,
-                'msg': f'Backtest range exceeds limit: timeframe {timeframe} supports up to {max_range_text} ({max_days} days), but you selected {days_diff} days',
-                'data': None
+                'msg': range_error['msg'],
+                'data': range_error
             }), 400
 
-        svc = get_backtest_service()
         result = svc.run_strategy_snapshot(snapshot, start_date=start_date, end_date=end_date)
         ea = dict(result.get('executionAssumptions') or {})
         ea['commission'] = round(float(snapshot.get('commission') or 0), 6)
@@ -598,6 +696,45 @@ def batch_start_strategies():
         
         if not strategy_ids:
             return jsonify({'code': 0, 'msg': 'Please provide strategy IDs', 'data': None}), 400
+
+        seen_live_keys: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+        batch_conflicts: List[Dict[str, Any]] = []
+        for sid in strategy_ids:
+            st = get_strategy_service().get_strategy(int(sid), user_id=user_id)
+            if not st:
+                continue
+            existing_conflict = _find_live_strategy_conflict(st, user_id)
+            if existing_conflict:
+                batch_conflicts.append({
+                    'strategy_id': int(sid),
+                    'conflict': existing_conflict,
+                    'message': _live_conflict_message(existing_conflict),
+                })
+                continue
+            key = _strategy_live_lock_key(st, user_id)
+            if key and key in seen_live_keys:
+                other = seen_live_keys[key]
+                conflict = {
+                    'strategy_id': other.get('id'),
+                    'strategy_name': other.get('strategy_name') or other.get('name') or str(other.get('id')),
+                    'symbol': key[-1],
+                    'market_type': key[-2],
+                    'exchange_id': key[-3],
+                }
+                batch_conflicts.append({
+                    'strategy_id': int(sid),
+                    'conflict': conflict,
+                    'message': _live_conflict_message(conflict),
+                })
+            elif key:
+                seen_live_keys[key] = st
+
+        if batch_conflicts:
+            return jsonify({
+                'code': 0,
+                'msg': 'Live strategy conflict',
+                'data': {'conflicts': batch_conflicts},
+            }), 409
         
         # Update database status first
         result = get_strategy_service().batch_start_strategies(strategy_ids, user_id=user_id)
@@ -771,6 +908,10 @@ def get_trades():
         market_type = str(trading_config.get("market_type") or st.get("market_type") or "swap").strip().lower()
         if is_derivatives_market(market_type):
             market_type = "swap"
+        try:
+            initial_capital = float(st.get("initial_capital") or trading_config.get("initial_capital") or 0.0)
+        except Exception:
+            initial_capital = 0.0
         from app.services.live_trading.records import ensure_strategy_trades_close_reason_column
         ensure_strategy_trades_close_reason_column()
 
@@ -895,6 +1036,10 @@ def get_positions():
         market_type = str(trading_config.get("market_type") or st.get("market_type") or "swap").strip().lower()
         if is_derivatives_market(market_type):
             market_type = "swap"
+        try:
+            initial_capital = float(st.get("initial_capital") or trading_config.get("initial_capital") or 0.0)
+        except Exception:
+            initial_capital = 0.0
 
         exchange_config = st.get("exchange_config") if isinstance(st.get("exchange_config"), dict) else {}
         from app.data_sources.crypto import resolve_crypto_venue
@@ -1008,6 +1153,9 @@ def get_positions():
                 pnl = calc_unrealized_pnl(side, entry, cp, size)
                 pct = calc_pnl_percent(entry, size, pnl, leverage=leverage, market_type=market_type)
                 notional = calc_notional_value(entry, size)
+                margin_value = calc_margin_notional(notional, leverage, market_type)
+                notional_pct = (pnl / notional * 100.0) if notional > 0 else 0.0
+                capital_pct = (pnl / initial_capital * 100.0) if initial_capital > 0 else 0.0
 
                 rr = dict(r)
                 # 确保 entry_price 有值（如果数据库中是 NULL，使用计算出的 entry 值）
@@ -1018,8 +1166,12 @@ def get_positions():
                 rr["current_price"] = float(cp or 0.0)
                 rr["unrealized_pnl"] = float(pnl)
                 rr["pnl_percent"] = float(pct)
+                rr["position_margin_pnl_percent"] = float(pct)
+                rr["position_notional_pnl_percent"] = float(notional_pct)
+                rr["strategy_capital_pnl_percent"] = float(capital_pct)
+                rr["capital_contribution_percent"] = float(capital_pct)
                 rr["notional_value"] = float(notional)
-                rr["margin_value"] = calc_margin_notional(notional, leverage, market_type)
+                rr["margin_value"] = margin_value
                 rr["updated_at"] = now
                 out.append(rr)
 
@@ -1060,6 +1212,45 @@ def get_positions():
                 if normalize_strategy_symbol(str(r.get("symbol") or "")).upper() in allowed_upper
             ]
 
+        account_reconciliation = {
+            "status": "not_checked",
+            "notes": [],
+            "account_positions": [],
+        }
+        if execution_mode == "live":
+            try:
+                from app.services.exchange_execution import resolve_exchange_config
+                from app.services.live_trading.account_positions import (
+                    list_account_positions,
+                    reconcile_strategy_vs_account,
+                )
+                from app.services.live_trading.leg_context import credential_id_from_exchange_config
+
+                resolved_ex = resolve_exchange_config(exchange_config, user_id=int(user_id or 1))
+                cred_id = int(
+                    credential_id_from_exchange_config(resolved_ex)
+                    or credential_id_from_exchange_config(exchange_config)
+                    or 0
+                )
+                account_rows = list_account_positions(
+                    user_id=int(user_id),
+                    credential_id=cred_id if cred_id > 0 else None,
+                    market_type=market_type,
+                )
+                if allowed:
+                    account_rows = [
+                        r for r in account_rows
+                        if normalize_strategy_symbol(str(r.get("symbol") or "")).upper() in allowed_upper
+                    ]
+                account_reconciliation = reconcile_strategy_vs_account(out, account_rows)
+                account_reconciliation["account_positions"] = account_rows
+            except Exception as e:
+                account_reconciliation = {
+                    "status": "error",
+                    "notes": [str(e)],
+                    "account_positions": [],
+                }
+
         from app.services.live_trading.strategy_position_sync import strategy_uses_fill_ledger
 
         uses_fill_ledger = strategy_uses_fill_ledger(
@@ -1071,7 +1262,7 @@ def get_positions():
         )
         position_meta = {
             "source": "fill_ledger" if uses_fill_ledger else "strategy_ledger",
-            "synced_from_exchange": execution_mode == "live" and not uses_fill_ledger,
+            "synced_from_exchange": False,
             "hint_zh": (
                 "以下为策略账本持仓（由成交记录累计），网格策略不与交易所实时对账。"
                 "请对照 exchange_snapshot 查看交易所真实持仓。"
@@ -1082,7 +1273,7 @@ def get_positions():
                 "Strategy ledger positions (from fills). Grid bots skip live exchange reconciliation; "
                 "compare exchange_snapshot for actual exchange holdings."
                 if uses_fill_ledger
-                else "Strategy ledger positions, reconciled with the exchange when live."
+                else "Strategy ledger positions from this strategy's own fills. Exchange positions are only reconciliation hints."
             ),
         }
 
@@ -1116,6 +1307,7 @@ def get_positions():
                 'items': out,
                 'position_meta': position_meta,
                 'exchange_snapshot': exchange_snapshot,
+                'account_reconciliation': account_reconciliation,
             },
         })
     except Exception as e:
@@ -1415,7 +1607,7 @@ def stop_strategy():
         st = get_strategy_service().get_strategy(strategy_id, user_id=user_id)
         if not st:
             return jsonify({'code': 0, 'msg': 'Strategy not found', 'data': None}), 404
-        
+
         # Get strategy type
         strategy_type = get_strategy_service().get_strategy_type(strategy_id)
         
@@ -1480,6 +1672,16 @@ def start_strategy():
                 'msg': 'AI strategy has been removed; local edition does not support starting AI strategies',
                 'data': None
             }), 400
+
+        conflict = _find_live_strategy_conflict(st, user_id)
+        if conflict:
+            msg = _live_conflict_message(conflict)
+            return jsonify({
+                'code': 0,
+                'msg': msg,
+                'data': {'conflict': conflict},
+            }), 409
+
         get_strategy_service().update_strategy_status(strategy_id, 'running', user_id=user_id)
 
         executor = get_trading_executor()
@@ -2530,6 +2732,97 @@ def get_strategy_performance():
     except Exception as e:
         logger.error(f"get_strategy_performance failed: {str(e)}")
         return jsonify({'code': 0, 'msg': str(e)}), 500
+
+
+@strategy_blp.route('/strategies/review-report', methods=['POST'])
+@login_required
+def get_strategy_review_report():
+    """Build an AI-assisted strategy review report from factual trade records."""
+    try:
+        user_id = int(g.user_id)
+        data = request.get_json(silent=True) or {}
+
+        try:
+            strategy_id = int(request.args.get('id') or data.get('id') or data.get('strategy_id') or 0)
+        except Exception:
+            strategy_id = 0
+        if not strategy_id:
+            return jsonify({'code': 0, 'msg': 'Missing strategy id parameter', 'data': None}), 400
+
+        st = get_strategy_service().get_strategy(strategy_id, user_id=user_id)
+        if not st:
+            return jsonify({'code': 0, 'msg': 'Strategy not found', 'data': None}), 404
+
+        try:
+            lookback_days = int(data.get('lookback_days') or request.args.get('lookback_days') or 30)
+        except Exception:
+            lookback_days = 30
+
+        include_ai_raw = data.get('include_ai')
+        if include_ai_raw is None:
+            include_ai_raw = request.args.get('include_ai', '1')
+        include_ai = str(include_ai_raw).strip().lower() not in ('0', 'false', 'no', 'off')
+        language = str(data.get('language') or request.args.get('lang') or request.headers.get('Accept-Language') or 'zh-CN')
+
+        from app.services.strategy_review import StrategyReviewService
+        report = StrategyReviewService().build_report(
+            strategy_id=int(strategy_id),
+            user_id=user_id,
+            lookback_days=lookback_days,
+            include_ai=include_ai,
+            language=language,
+        )
+        return jsonify({'code': 1, 'msg': 'success', 'data': report})
+    except Exception as e:
+        logger.error(f"get_strategy_review_report failed: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
+
+
+@strategy_blp.route('/strategies/review-report/history', methods=['GET'])
+@login_required
+def get_strategy_review_report_history():
+    """List or load saved AI strategy review reports."""
+    try:
+        user_id = int(g.user_id)
+        try:
+            strategy_id = int(request.args.get('id') or request.args.get('strategy_id') or 0)
+        except Exception:
+            strategy_id = 0
+        if not strategy_id:
+            return jsonify({'code': 0, 'msg': 'Missing strategy id parameter', 'data': None}), 400
+
+        st = get_strategy_service().get_strategy(strategy_id, user_id=user_id)
+        if not st:
+            return jsonify({'code': 0, 'msg': 'Strategy not found', 'data': None}), 404
+
+        from app.services.strategy_review import StrategyReviewService
+        service = StrategyReviewService()
+        try:
+            report_id = int(request.args.get('report_id') or 0)
+        except Exception:
+            report_id = 0
+
+        if report_id:
+            report = service.get_history_report(
+                report_id=report_id,
+                strategy_id=strategy_id,
+                user_id=user_id,
+            )
+            if not report:
+                return jsonify({'code': 0, 'msg': 'Review report not found', 'data': None}), 404
+            return jsonify({'code': 1, 'msg': 'success', 'data': report})
+
+        try:
+            limit = int(request.args.get('limit') or 20)
+        except Exception:
+            limit = 20
+        history = service.list_history(strategy_id=strategy_id, user_id=user_id, limit=limit)
+        return jsonify({'code': 1, 'msg': 'success', 'data': history})
+    except Exception as e:
+        logger.error(f"get_strategy_review_report_history failed: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
 
 
 @strategy_blp.route('/strategies/logs', methods=['GET'])

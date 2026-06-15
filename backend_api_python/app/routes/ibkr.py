@@ -72,7 +72,7 @@ def connect():
 
     Request body:
         host (optional, default 127.0.0.1): TWS/Gateway host
-        port (optional, default 7497): TWS Live 7497, TWS Paper 7496, Gateway Live 4001, Gateway Paper 4002
+        port (optional, default 7497): TWS Live 7496, TWS Paper 7497, Gateway Live 4001, Gateway Paper 4002
         clientId (optional, default 1): Client ID
         account (optional): Account for multi-account setups
         readonly (optional, default false): Read-only mode

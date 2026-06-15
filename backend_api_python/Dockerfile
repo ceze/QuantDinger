@@ -7,6 +7,8 @@ FROM ${BASE_IMAGE}
 #   cn      -> Aliyun mirrors first, fall back to official on failure (default; zero-config for China)
 #   global  -> use Debian/PyPI official directly, skip Aliyun entirely (used by GitHub Actions runners)
 ARG BUILD_REGION=cn
+ARG APP_VERSION=""
+ARG GIT_TAG=""
 
 WORKDIR /app
 
@@ -59,6 +61,9 @@ RUN set -eux; \
     rm -rf /var/lib/apt/lists/*
 
 COPY . .
+
+RUN printf '%s\n' "$APP_VERSION" > /app/BUILD_VERSION \
+    && printf '%s\n' "$GIT_TAG" > /app/BUILD_GIT_TAG
 
 COPY docker-entrypoint.sh /usr/local/bin/
 RUN sed -i 's/\r$//' /usr/local/bin/docker-entrypoint.sh \

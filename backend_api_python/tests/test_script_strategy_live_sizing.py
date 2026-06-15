@@ -323,3 +323,72 @@ def test_fetch_latest_kline_keeps_xaut_on_configured_crypto_market():
     assert kwargs["market"] == "Crypto"
     assert kwargs["exchange_id"] == "bitget"
     assert kwargs["market_type"] == "swap"
+
+
+@patch("app.services.trading_executor.append_strategy_log")
+@patch.object(TradingExecutor, "_execute_exchange_order", return_value={"success": True})
+@patch.object(TradingExecutor, "_get_available_capital", return_value=100.0)
+@patch.object(TradingExecutor, "_get_daily_pnl", return_value=0.0)
+def test_signal_mode_close_records_matched_entry_price(_daily, _cap, _order, _log):
+    ex = _make_executor()
+    ex._record_trade = MagicMock()
+    ex._close_position = MagicMock()
+    ex._simulated_open_qty_from_trade_rows = MagicMock(return_value=0.5)
+
+    ok = ex._execute_signal(
+        strategy_id=6,
+        strategy_name="paper",
+        exchange=MagicMock(),
+        symbol="ETH/USDT",
+        current_price=1900.0,
+        signal_type="close_short",
+        position_size=0,
+        current_positions=[
+            {"symbol": "ETH/USDT", "side": "short", "size": 0.5, "entry_price": 2000.0}
+        ],
+        trade_direction="both",
+        leverage=1,
+        initial_capital=1000.0,
+        market_type="swap",
+        execution_mode="signal",
+        trading_config={},
+    )
+
+    assert ok is True
+    ex._record_trade.assert_called_once()
+    assert ex._record_trade.call_args.kwargs["matched_entry_price"] == pytest.approx(2000.0)
+
+
+@patch("app.services.trading_executor.append_strategy_log")
+@patch.object(TradingExecutor, "_execute_exchange_order", return_value={"success": True})
+@patch.object(TradingExecutor, "_get_available_capital", return_value=100.0)
+@patch.object(TradingExecutor, "_get_daily_pnl", return_value=0.0)
+def test_signal_mode_rejects_ghost_close_without_unmatched_open_trade(_daily, _cap, mock_order, _log):
+    ex = _make_executor()
+    ex._record_trade = MagicMock()
+    ex._close_position = MagicMock()
+    ex._simulated_open_qty_from_trade_rows = MagicMock(return_value=0.0)
+
+    ok = ex._execute_signal(
+        strategy_id=6,
+        strategy_name="paper",
+        exchange=MagicMock(),
+        symbol="ETH/USDT",
+        current_price=1800.0,
+        signal_type="close_short",
+        position_size=0,
+        current_positions=[
+            {"symbol": "ETH/USDT", "side": "short", "size": 0.5, "entry_price": 2000.0}
+        ],
+        trade_direction="both",
+        leverage=1,
+        initial_capital=1000.0,
+        market_type="swap",
+        execution_mode="signal",
+        trading_config={},
+    )
+
+    assert ok is False
+    mock_order.assert_not_called()
+    ex._record_trade.assert_not_called()
+    ex._close_position.assert_called_once_with(6, "ETH/USDT", "short")

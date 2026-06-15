@@ -59,7 +59,7 @@ class ApiInfoSchema(Schema):
     """GET / — API identity payload."""
 
     name = fields.String(metadata={"example": "QuantDinger Python API"})
-    version = fields.String(metadata={"example": "3.0.22"})
+    version = fields.String(metadata={"example": "3.0.23"})
     status = fields.String(metadata={"example": "running"})
     timestamp = fields.DateTime(format="iso")
 

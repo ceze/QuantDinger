@@ -25,7 +25,7 @@ CREATE TABLE IF NOT EXISTS qd_users (
     chart_templates TEXT DEFAULT '',      -- 用户图表模板 JSON（指标布局/样式）
     timezone VARCHAR(64) DEFAULT '',       -- IANA 时区标识，空表示跟随客户端/浏览器
     token_version INTEGER DEFAULT 1,       -- Token版本号，用于单一客户端登录控制
-    password_changed_at TIMESTAMP,           -- NULL = 仍使用创建时的初始密码，需提示修改
+    password_changed_at TIMESTAMP,           -- NULL only prompts when bootstrap password is still 123456
     last_login_at TIMESTAMP,
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW()
@@ -387,6 +387,29 @@ CREATE INDEX IF NOT EXISTS idx_trades_strategy_id ON qd_strategy_trades(strategy
 CREATE INDEX IF NOT EXISTS idx_trades_created_at ON qd_strategy_trades(created_at);
 CREATE INDEX IF NOT EXISTS idx_trades_strategy_symbol_canon ON qd_strategy_trades (strategy_id, market_type, symbol_canonical);
 CREATE INDEX IF NOT EXISTS idx_positions_strategy_leg ON qd_strategy_positions (strategy_id, market_type, symbol_canonical, side);
+
+-- Strategy AI review report history.
+CREATE TABLE IF NOT EXISTS qd_strategy_review_reports (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL DEFAULT 1 REFERENCES qd_users(id) ON DELETE CASCADE,
+    strategy_id INTEGER REFERENCES qd_strategies_trading(id) ON DELETE CASCADE,
+    lookback_days INTEGER NOT NULL DEFAULT 30,
+    language VARCHAR(20) DEFAULT 'zh-CN',
+    include_ai BOOLEAN DEFAULT TRUE,
+    ai_status VARCHAR(32) DEFAULT '',
+    summary TEXT DEFAULT '',
+    total_net_pnl DECIMAL(20,8) DEFAULT 0,
+    total_return_pct DECIMAL(20,8) DEFAULT 0,
+    win_rate DECIMAL(20,8) DEFAULT 0,
+    profit_factor DECIMAL(20,8) DEFAULT 0,
+    max_drawdown_pct DECIMAL(20,8) DEFAULT 0,
+    report_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_strategy_review_reports_strategy
+    ON qd_strategy_review_reports(strategy_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_strategy_review_reports_user
+    ON qd_strategy_review_reports(user_id, created_at DESC);
 
 -- L1 account position mirror (exchange truth per credential + inst_id + side)
 CREATE TABLE IF NOT EXISTS qd_account_positions (

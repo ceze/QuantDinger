@@ -4,6 +4,7 @@ Backtest Service
 import hashlib
 import json
 import math
+import re
 import threading
 import time as _time
 import traceback
@@ -17,6 +18,7 @@ import numpy as np
 from app.data_sources import DataSourceFactory
 from app.utils.logger import get_logger
 from app.utils.db import get_db_connection
+from app.utils.risk_guard import trailing_exit_locks_net_profit
 from app.services.indicator_params import IndicatorParamsParser, IndicatorCaller
 
 logger = get_logger(__name__)
@@ -91,6 +93,97 @@ class BacktestService:
 
     def __init__(self):
         self._storage_schema_ready = False
+
+    def _estimate_warmup_bars(
+        self,
+        indicator_code: str,
+        indicator_params: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        """Estimate indicator warmup bars from declared numeric period params."""
+        try:
+            declared = IndicatorParamsParser.parse_params(indicator_code or "")
+            merged = IndicatorParamsParser.merge_params(declared, indicator_params or {})
+        except Exception:
+            merged = {}
+
+        max_period = 0
+        period_name_re = re.compile(
+            r"(len|length|period|window|lookback|ema|sma|rsi|adx|atr|vol|ma)$",
+            re.IGNORECASE,
+        )
+        for key, value in (merged or {}).items():
+            name = str(key or "")
+            try:
+                n = int(float(value))
+            except Exception:
+                continue
+            if n <= 1 or n > 10000:
+                continue
+            if period_name_re.search(name) or name.endswith("_n"):
+                max_period = max(max_period, n)
+
+        if max_period <= 0:
+            return 0
+        return int(min(max_period + max(50, math.ceil(max_period * 0.5)), 2000))
+
+    def _warmup_start_date(self, start_date: datetime, timeframe: str, warmup_bars: int) -> datetime:
+        if warmup_bars <= 0:
+            return start_date
+        tf_seconds = self.TIMEFRAME_SECONDS.get(timeframe, 86400)
+        return start_date - timedelta(seconds=tf_seconds * warmup_bars)
+
+    def _slice_to_backtest_window(
+        self,
+        df: pd.DataFrame,
+        start_date: datetime,
+        end_date: datetime,
+    ) -> pd.DataFrame:
+        if df is None or df.empty:
+            return pd.DataFrame()
+        rs = pd.Timestamp(start_date)
+        re = pd.Timestamp(end_date)
+        out = df[(df.index >= rs) & (df.index <= re)].copy()
+        if getattr(df, "attrs", None):
+            out.attrs.update(df.attrs)
+        return out
+
+    def _slice_signals_to_window(
+        self,
+        signals: Dict[str, Any],
+        target_index: pd.Index,
+    ) -> Dict[str, Any]:
+        out: Dict[str, Any] = {}
+        for key, value in (signals or {}).items():
+            if str(key).startswith("_"):
+                out[key] = value
+                continue
+            if hasattr(value, "reindex"):
+                fill = False
+                try:
+                    if getattr(value, "dtype", None) is not None and not pd.api.types.is_bool_dtype(value):
+                        fill = 0.0
+                except Exception:
+                    fill = False
+                out[key] = value.reindex(target_index, fill_value=fill)
+            else:
+                out[key] = value
+        return out
+
+    def _attach_warmup_to_result(
+        self,
+        result: Dict[str, Any],
+        *,
+        warmup_bars: int,
+        warmup_start: datetime,
+        requested_start: datetime,
+    ) -> None:
+        if warmup_bars <= 0:
+            return
+        ea = dict(result.get("executionAssumptions") or {})
+        ea["indicatorWarmupBars"] = int(warmup_bars)
+        ea["indicatorWarmupStart"] = str(warmup_start)
+        ea["requestedStart"] = str(requested_start)
+        result["executionAssumptions"] = ea
 
     def ensure_storage_schema(self) -> None:
         if self._storage_schema_ready:
@@ -612,11 +705,17 @@ class BacktestService:
             result['executionAssumptions'] = ea
             return result
         
-        logger.info(f"Multi-timeframe backtest: strategy_tf={timeframe}, exec_tf={exec_tf}, range={start_date} ~ {end_date}")
+        warmup_bars = self._estimate_warmup_bars(indicator_code, indicator_params)
+        signal_start_date = self._warmup_start_date(start_date, timeframe, warmup_bars)
+
+        logger.info(
+            f"Multi-timeframe backtest: strategy_tf={timeframe}, exec_tf={exec_tf}, "
+            f"range={start_date} ~ {end_date}, warmup_bars={warmup_bars}"
+        )
         
         # 1. Fetch strategy timeframe candles (for signal generation)
-        df_signal = self._fetch_kline_data(market, symbol, timeframe, start_date, end_date)
-        if df_signal.empty:
+        df_signal_full = self._fetch_kline_data(market, symbol, timeframe, signal_start_date, end_date)
+        if df_signal_full.empty:
             raise ValueError("No candle data available in the backtest date range")
         
         # 2. Execute indicator code to get signals
@@ -629,7 +728,11 @@ class BacktestService:
             'user_id': user_id,
             'indicator_id': indicator_id,
         }
-        signals = self._execute_indicator(indicator_code, df_signal, backtest_params)
+        signals_full = self._execute_indicator(indicator_code, df_signal_full, backtest_params)
+        df_signal = self._slice_to_backtest_window(df_signal_full, start_date, end_date)
+        if df_signal.empty:
+            raise ValueError("No candle data available in the backtest date range")
+        signals = self._slice_signals_to_window(signals_full, df_signal.index)
         logger.info(f"Signals generated: {list(signals.keys()) if isinstance(signals, dict) else type(signals)}")
         
         # 3. Fetch execution timeframe candles (for precise trade simulation)
@@ -729,6 +832,12 @@ class BacktestService:
                 mtf_requested=True,
                 mtf_active=True,
             )
+            self._attach_warmup_to_result(
+                result,
+                warmup_bars=warmup_bars,
+                warmup_start=signal_start_date,
+                requested_start=start_date,
+            )
             self._attach_actual_range_to_result(result, df_signal)
             logger.info("Backtest result formatted successfully")
         except Exception as e:
@@ -784,6 +893,13 @@ class BacktestService:
         trailing_enabled = bool(trailing_cfg.get('enabled'))
         trailing_pct = float(trailing_cfg.get('pct') or 0.0)
         trailing_activation_pct = float(trailing_cfg.get('activationPct') or 0.0)
+        exit_owner = str(cfg.get('exitOwner') or cfg.get('exit_owner') or '').strip().lower()
+        if exit_owner == 'indicator':
+            stop_loss_pct = 0.0
+            take_profit_pct = 0.0
+            trailing_enabled = False
+            trailing_pct = 0.0
+            trailing_activation_pct = 0.0
 
         # Signal-timing mode (next_bar_open / same_bar_close / ...). Mirrors the
         # parsing done in `run_multi_timeframe`/`run`/`run_strategy_script`. It's
@@ -1263,8 +1379,13 @@ class BacktestService:
                                 trail_active = highest_since_entry >= entry_price * (1 + trailing_activation_pct_eff)
                             if trail_active:
                                 tr_price = highest_since_entry * (1 - trailing_pct_eff)
-                                if path_price <= tr_price:
-                                    exec_price = tr_price * (1 - slippage)
+                                exec_price = tr_price * (1 - slippage)
+                                if path_price <= tr_price and trailing_exit_locks_net_profit(
+                                    "long",
+                                    entry_price=entry_price,
+                                    exit_price=exec_price,
+                                    fee_rate=commission,
+                                ):
                                     commission_fee = position * exec_price * commission
                                     profit = (exec_price - entry_price) * position - commission_fee
                                     capital += profit
@@ -1359,8 +1480,13 @@ class BacktestService:
                                 trail_active = lowest_since_entry <= entry_price * (1 - trailing_activation_pct_eff)
                             if trail_active:
                                 tr_price = lowest_since_entry * (1 + trailing_pct_eff)
-                                if path_price >= tr_price:
-                                    exec_price = tr_price * (1 + slippage)
+                                exec_price = tr_price * (1 + slippage)
+                                if path_price >= tr_price and trailing_exit_locks_net_profit(
+                                    "short",
+                                    entry_price=entry_price,
+                                    exit_price=exec_price,
+                                    fee_rate=commission,
+                                ):
                                     commission_fee = shares * exec_price * commission
                                     profit = (entry_price - exec_price) * shares - commission_fee
                                     if capital + profit <= 0:
@@ -1749,11 +1875,13 @@ class BacktestService:
             'trade_direction': trade_direction,
             'strategy_config': strategy_config or {},
         })
+        script_logs = signals.pop('logs', [])
         equity_curve, trades, total_commission = self._simulate_trading(
             df, signals, initial_capital, commission, slippage, leverage, trade_direction, strategy_config
         )
         metrics = self._calculate_metrics(equity_curve, trades, initial_capital, timeframe, start_date, end_date, total_commission)
         result = self._format_result(metrics, equity_curve, trades)
+        result['logs'] = script_logs
         result['precision_info'] = {
             'enabled': False,
             'timeframe': timeframe,
@@ -2002,9 +2130,13 @@ class BacktestService:
             Backtest result
         """
         
-        # 1. Fetch candle data
-        df = self._fetch_kline_data(market, symbol, timeframe, start_date, end_date)
-        if df.empty:
+        warmup_bars = self._estimate_warmup_bars(indicator_code, indicator_params)
+        signal_start_date = self._warmup_start_date(start_date, timeframe, warmup_bars)
+
+        # 1. Fetch candle data. Indicators execute on warmup+window data, while
+        # trading starts strictly at the user-requested start_date.
+        df_full = self._fetch_kline_data(market, symbol, timeframe, signal_start_date, end_date)
+        if df_full.empty:
             raise ValueError("No candle data available in the backtest date range")
         
         
@@ -2018,7 +2150,11 @@ class BacktestService:
             'user_id': user_id,
             'indicator_id': indicator_id,
         }
-        signals = self._execute_indicator(indicator_code, df, backtest_params)
+        signals_full = self._execute_indicator(indicator_code, df_full, backtest_params)
+        df = self._slice_to_backtest_window(df_full, start_date, end_date)
+        if df.empty:
+            raise ValueError("No candle data available in the backtest date range")
+        signals = self._slice_signals_to_window(signals_full, df.index)
         
         # 3. Simulate trading
         equity_curve, trades, total_commission = self._simulate_trading(
@@ -2042,6 +2178,12 @@ class BacktestService:
             strategy_config,
             simulation_mode='standard',
             signal_timeframe=timeframe,
+        )
+        self._attach_warmup_to_result(
+            result,
+            warmup_bars=warmup_bars,
+            warmup_start=signal_start_date,
+            requested_start=start_date,
         )
         self._attach_actual_range_to_result(result, df)
         return result
@@ -2327,7 +2469,8 @@ class BacktestService:
             if has_output_signals and not has_four_way and not has_buy_sell:
                 raise ValueError(
                     "Invalid indicator script: output['signals'] is provided, but df execution columns are missing. "
-                    "Set df['buy'] and df['sell'], or four-way df['open_long'/'close_long'/'open_short'/'close_short']."
+                    "Set four-way df['open_long'], df['close_long'], df['open_short'], and df['close_short']. "
+                    "output['signals'] is chart-only and cannot place orders."
                 )
             
             # Extract signals from executed df
@@ -2369,7 +2512,7 @@ class BacktestService:
                 raise ValueError(
                     "Indicator must define either 4-way columns "
                     "(df['open_long'], df['close_long'], df['open_short'], df['close_short']) "
-                    "or simple columns (df['buy'], df['sell'])."
+                    "for new scripts. Legacy df['buy']/df['sell'] is still executable only for existing saved code."
                 )
             
         except Exception as e:
@@ -2378,7 +2521,7 @@ class BacktestService:
         
         return signals
 
-    def _execute_script_strategy(self, code: str, df: pd.DataFrame, runtime: Optional[Dict[str, Any]] = None) -> Dict[str, pd.Series]:
+    def _execute_script_strategy(self, code: str, df: pd.DataFrame, runtime: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         runtime = runtime or {}
         if not code or not str(code).strip():
             raise ValueError("Strategy script is empty")
@@ -2521,6 +2664,7 @@ class BacktestService:
                 'close_short': close_short,
                 'add_long': add_long,
                 'add_short': add_short,
+                'logs': ctx.flush_logs(),
             }
         except Exception as e:
             logger.error(f"Strategy script execution error: {e}")
@@ -2715,6 +2859,13 @@ class BacktestService:
         trailing_enabled = bool(trailing_cfg.get('enabled'))
         trailing_pct = float(trailing_cfg.get('pct') or 0.0)
         trailing_activation_pct = float(trailing_cfg.get('activationPct') or 0.0)
+        exit_owner = str(cfg.get('exitOwner') or cfg.get('exit_owner') or '').strip().lower()
+        if exit_owner == 'indicator':
+            stop_loss_pct = 0.0
+            take_profit_pct = 0.0
+            trailing_enabled = False
+            trailing_pct = 0.0
+            trailing_activation_pct = 0.0
 
         # Risk percentages are the underlying's % price move directly.
         # Leverage only affects PnL magnitude / liquidation, NOT trigger thresholds.
@@ -2907,7 +3058,13 @@ class BacktestService:
                             trail_active = highest_since_entry >= entry_price * (1 + trailing_activation_pct_eff)
                         if trail_active:
                             tr_price = highest_since_entry * (1 - trailing_pct_eff)
-                            if low <= tr_price:
+                            tr_exec_price = tr_price * (1 - slippage)
+                            if low <= tr_price and trailing_exit_locks_net_profit(
+                                "long",
+                                entry_price=entry_price,
+                                exit_price=tr_exec_price,
+                                fee_rate=commission,
+                            ):
                                 candidates.append(('close_long_trailing', tr_price))
 
                     if candidates:
@@ -2958,7 +3115,13 @@ class BacktestService:
                             trail_active = lowest_since_entry <= entry_price * (1 - trailing_activation_pct_eff)
                         if trail_active:
                             tr_price = lowest_since_entry * (1 + trailing_pct_eff)
-                            if high >= tr_price:
+                            tr_exec_price = tr_price * (1 + slippage)
+                            if high >= tr_price and trailing_exit_locks_net_profit(
+                                "short",
+                                entry_price=entry_price,
+                                exit_price=tr_exec_price,
+                                fee_rate=commission,
+                            ):
                                 candidates.append(('close_short_trailing', tr_price))
 
                     if candidates:

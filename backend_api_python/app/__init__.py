@@ -391,6 +391,15 @@ def create_app(config_name='default'):
         # Ensure admin user exists (multi-user mode)
         from app.services.user_service import get_user_service
         get_user_service().ensure_admin_exists()
+
+        # Keep persisted official indicator samples aligned with the current
+        # execution contract. This is intentionally best-effort so a failed
+        # sample migration never prevents the API from booting.
+        try:
+            from app.services.builtin_indicators import upgrade_builtin_indicator_samples
+            upgrade_builtin_indicator_samples()
+        except Exception as sample_exc:
+            logger.warning(f"Builtin indicator sample upgrade skipped: {sample_exc}")
     except Exception as e:
         logger.warning(f"Database initialization note: {e}")
 

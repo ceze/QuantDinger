@@ -5,7 +5,9 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 from app.services.exchange_execution import resolve_exchange_config
+from app.services.grid.config import GridBotConfig
 from app.services.grid.runner import GridRestingRunner
+from app.services.grid.validator import validate_grid_config
 
 
 def test_resolve_exchange_config_merges_credential_id():
@@ -97,3 +99,27 @@ def test_grid_startup_places_limits_when_client_ok():
     assert ok is True
     assert msg == ""
     assert place.called
+
+
+def test_grid_config_rejects_spacing_that_cannot_cover_round_trip_fees():
+    cfg = GridBotConfig.from_trading_config(
+        {
+            "leverage": 5,
+            "market_type": "swap",
+            "initial_capital": 100,
+            "commission": 0.1,
+            "bot_params": {
+                "upperPrice": 1647.07,
+                "lowerPrice": 1644.47,
+                "gridCount": 2,
+                "amountPerGrid": 5,
+                "gridDirection": "long",
+                "initialPositionPct": 0,
+            },
+        }
+    )
+    ok, msg, warnings = validate_grid_config(cfg, initial_capital=100, fee_rate=0.001)
+
+    assert ok is False
+    assert warnings == []
+    assert "too narrow after fees" in msg

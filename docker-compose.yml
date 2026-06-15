@@ -89,6 +89,10 @@ services:
         # cn (default): use Aliyun apt/PyPI mirrors with fallback to official.
         # global: use official sources directly (recommended for overseas builds).
         BUILD_REGION: ${BUILD_REGION:-cn}
+        # Release CI injects APP_VERSION from the Git tag. Local builds may set
+        # APP_VERSION explicitly, or GIT_TAG/IMAGE_TAG as a non-floating fallback.
+        APP_VERSION: ${APP_VERSION:-}
+        GIT_TAG: ${GIT_TAG:-${IMAGE_TAG:-}}
     container_name: quantdinger-backend
     restart: unless-stopped
     depends_on:
@@ -106,6 +110,7 @@ services:
     environment:
       - PYTHON_API_HOST=0.0.0.0
       - PYTHON_API_PORT=5000
+      - GIT_TAG=${GIT_TAG:-${IMAGE_TAG:-}}
       - TZ=${TZ:-Asia/Shanghai}
       - DATABASE_URL=postgresql://${POSTGRES_USER:-quantdinger}:${POSTGRES_PASSWORD:-quantdinger123}@postgres:5432/${POSTGRES_DB:-quantdinger}
       - DB_TYPE=postgresql

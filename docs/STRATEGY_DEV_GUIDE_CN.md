@@ -104,6 +104,10 @@ QuantDinger 当前支持两条 Python 开发路径：
 my_indicator_name = "Trend Pullback Strategy"
 my_indicator_description = "Buy pullbacks in an uptrend and exit on weakness."
 
+# signal_form: two_way
+# exit_owner: engine
+# flip_mode: R2
+
 # @param fast_len int 20 Fast EMA length
 # @param slow_len int 50 Slow EMA length
 # @param rsi_len int 14 RSI length
@@ -237,7 +241,7 @@ df['sell'] = sig_sell_entry | sig_long_tp | sig_long_sl
 
 止盈止损和仓位管理最容易在这里写乱。
 
-在 `IndicatorStrategy` 里，退出逻辑通常有两种合法写法。
+在 `IndicatorStrategy` 里，退出逻辑通常有两种合法写法，并且必须通过头部契约声明清楚。
 
 #### 写法 A：信号自己负责退出
 
@@ -252,6 +256,15 @@ df['sell'] = sig_sell_entry | sig_long_tp | sig_long_sl
 
 如果退出本身就是策略思想的一部分，用这种写法最自然。
 
+这种写法请声明：
+
+```python
+# exit_owner: indicator
+# @strategy trailingEnabled false
+```
+
+当前后端会把 `exit_owner: indicator` 解释为：服务端固定止损、固定止盈、追踪止损都不主动平仓；退出以指标信号为准。`entryPct` / `tradeDirection` 仍然可以继续作为默认配置使用。
+
 #### 写法 B：引擎负责固定止盈止损
 
 也就是你只定义默认配置，由引擎按固定规则处理：
@@ -263,16 +276,24 @@ df['sell'] = sig_sell_entry | sig_long_tp | sig_long_sl
 
 如果你的信号逻辑想保持简洁，而保护性规则是固定的，就用这种写法。
 
+这种写法请声明：
+
+```python
+# exit_owner: engine
+```
+
+`exit_owner: engine` 表示服务端价格风控有效。代码里可以保留“趋势反转平仓”这类结构性 `close_*`，但不要再把窄止盈/窄止损触及条件也写进指标信号里。
+
 #### 最佳实践
 
 尽量明确一个“主退出来源”。
 
 例如：
 
-- 如果你的核心逻辑是“金叉进，死叉出”，那退出就主要由 `sell` 信号负责
-- 如果你的逻辑是“信号进场，固定 3% 止损 + 6% 止盈管理交易”，那退出主要由 `# @strategy` 负责
+- 如果你的核心逻辑是“金叉进，死叉出”，且没有额外固定价格风控，那退出就主要由指标信号负责，写 `# exit_owner: indicator`
+- 如果你的逻辑是“信号进场，固定 3% 止损 + 6% 止盈管理交易”，或只把 `close_*` 当作趋势反转时的结构性平仓，那价格退出主要由引擎负责，写 `# exit_owner: engine`
 
-两者可以同时存在，但一定要在注释或描述里写清楚，否则别的开发者不知道到底是**信号退出**还是**引擎退出**在起主要作用。
+不要写 `exit_owner: layered`。当前平台未实现第三种退出负责人；如果你确实要混合方案，先按 `engine` 写并在评审里说明哪些 `close_*` 只是趋势反转，不是窄 tp/sl。
 
 ### 3.5 第五步：最后再组装 `output`
 
@@ -341,7 +362,7 @@ output = {
 建议（与回测对齐时）：
 
 - 策略配置里将 `signal_mode`、`exit_signal_mode` 设为 **`confirmed`**（只在上一根已收盘 K 上读信号）。
-- 指标内已用 `sig_*_tp` / `sig_*_sl` 表达退出时，避免再开 `# @strategy trailingEnabled true`，否则会出现「指标止盈 + 服务端移动止损」**双重平仓**，并放大时间差。
+- 指标内已用 `sig_*_tp` / `sig_*_sl` 表达退出时，声明 `# exit_owner: indicator` 并保持 `# @strategy trailingEnabled false`，否则会出现「指标退出 + 服务端追踪止损」**双重平仓**，并放大时间差。
 - 上线前对比：回测成交时间、实盘日志里的 `Signal submitted` / `server_trailing_stop` 是否成对出现。
 
 实盘平仓若短暂出现「数量为 0」：执行器会**再次同步交易所持仓并重新解析数量**；若交易所确已空仓，才会拒单（例如移动止损已先平掉）。
@@ -524,6 +545,10 @@ output = {
 ```python
 my_indicator_name = "Breakout Retest With Direction Control"
 my_indicator_description = "Breakout-and-retest logic with platform-friendly params and default risk settings."
+
+# signal_form: two_way
+# exit_owner: engine
+# flip_mode: R2
 
 # @param breakout_len int 20 Breakout lookback bars
 # @param retest_buffer float 0.002 Retest tolerance ratio
@@ -1197,21 +1222,25 @@ df['sell'] = some_other_exit_condition  # 指标内多侧止盈
 
 ```python
 # 方案 A：退出全部由指标信号负责（推荐用于中轨/轨道触及类策略）
+# exit_owner: indicator
 # @strategy trailingEnabled false
-# Primary exit: df['buy'] / df['sell'] 内的 tp/sl 条件
+# Primary exit: close_* 或 df['buy'] / df['sell'] 内的 tp/sl 条件
+# stopLossPct / takeProfitPct / trailing* 不作为服务端退出
 
 # 方案 B：退出由引擎风控负责（固定止损/止盈/移动止损）
+# exit_owner: engine
 # @strategy trailingEnabled true
 # @strategy trailingStopPct 0.0025
 # @strategy trailingActivationPct 0.0037
-# df['buy'] / df['sell'] 只负责入场，不要在同 bar 再写 tp/sl
+# df['buy'] / df['sell'] 或 open_* 只负责入场；结构性反转 close_* 可以保留，窄 tp/sl 不要再写进指标
 ```
 
 为什么：
 
 - 两种退出方式并存时，回测与实盘都会执行**先到为准**的那条路径，日志里可能出现 `server_trailing_stop` 与指标 `close_*` 紧挨着，甚至「平仓数量为 0」的拒单（仓位已被移动止损平掉）。
-- `trailingEnabled true` 时，引擎会关闭与移动止损冲突的固定止盈语义；但这**不能**代替你在 `df['buy']`/`df['sell']` 里写的指标内止盈。
-- 真正的问题是没人说得清「主退出」是指标触及，还是 `# @strategy` 服务端风控。
+- `exit_owner: indicator` 时，后端会关闭服务端固定止损、固定止盈和追踪止损；`# @strategy` 里的这些退出参数不再生效。
+- `exit_owner: engine` 时，服务端价格风控生效；指标里的 `close_*` 应只表达趋势反转等结构性退出，不要再塞一套窄 tp/sl。
+- 真正的问题是没人说得清「主退出」是指标触及，还是 `# @strategy` 服务端风控；`exit_owner` 就是为了解决这个边界。
 
 ### 11.8 `both` 模式下把止盈/止损全塞进 `buy` / `sell`
 
@@ -1233,12 +1262,12 @@ df['sell'] = entry_short | long_tp | long_sl
 
 常见原因：
 
-1. 服务端移动止损/止盈已平仓，指标信号又提交了一次同向 `close_*`。
+1. 服务端止损/止盈/追踪止损已平仓，指标信号又提交了一次同向 `close_*`。
 2. 本地持仓表滞后于交易所；执行器会先 **sync + 按交易所持仓重算数量**，仍为空才拒单。
 
 处理建议：
 
-- 按 §11.7 避免双重退出；检查是否同时启用 `trailingEnabled` 与指标内 tp/sl。
+- 按 §11.7 避免双重退出；检查是否应改成 `# exit_owner: indicator`，或是否同时启用了 `trailingEnabled` 与指标内 tp/sl。
 - 确认 `tradeDirection both` 下对 `buy`/`sell` 的解释符合 §3.3.1，不要期待单独的 `close_short` 列。
 
 ---
@@ -1265,10 +1294,28 @@ df['sell'] = entry_short | long_tp | long_sl
 - **数值单位统一为 0–1 小数比例**（与 `StrategyConfigParser`、回测、实盘一致）
 - **止损/止盈/追踪按标的涨跌幅计算，不除以杠杆**（杠杆只影响盈亏金额与爆仓）
 - **`entryPct 1` 表示 100% 可用资金开仓**，不是 1%
+- 若声明 `# exit_owner: indicator`，`stopLossPct` / `takeProfitPct` / `trailing*` 在回测和实盘中都不会触发服务端平仓；退出以指标信号为准
+- 若声明 `# exit_owner: engine`，这些服务端价格风控参数才会参与平仓
 - 不要把 `leverage` 写进 `# @strategy`
 - 交易所、标的、凭证、杠杆都应该放在产品配置层
 
-### 12.2 `# @param` 速查格式
+### 12.2 契约头注释
+
+| Key | 支持值 | 含义 |
+|-----|--------|------|
+| `signal_form` | `two_way` / `four_way` | 执行信号形态 |
+| `exit_owner` | `indicator` / `engine` | 价格退出负责人；当前不支持 `layered` |
+| `flip_mode` | `R1` / `R2` | 反手时序：R1 下一根再开；R2 同 bar 先平后开 |
+
+推荐写在文件顶部：
+
+```python
+# signal_form: four_way
+# exit_owner: indicator
+# flip_mode: R1
+```
+
+### 12.3 `# @param` 速查格式
 
 | 部分 | 示例 | 含义 |
 |------|------|------|

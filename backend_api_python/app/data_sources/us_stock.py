@@ -6,6 +6,7 @@ from typing import Dict, List, Any, Optional
 from datetime import datetime, timedelta
 
 import yfinance as yf
+import requests
 
 from app.data_sources.base import BaseDataSource
 from app.utils.logger import get_logger
@@ -49,6 +50,26 @@ class USStockDataSource(BaseDataSource):
     MERGE_FACTOR_MAP = {
         '3m': 3,
     }
+
+    TIMEFRAME_ALIASES = {
+        '1h': '1H',
+        '1hour': '1H',
+        '60m': '1H',
+        '4h': '4H',
+        '1d': '1D',
+        '1day': '1D',
+        'd': '1D',
+        '1w': '1W',
+        '1wk': '1W',
+        'w': '1W',
+    }
+
+    NASDAQ_HEADERS = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json, text/plain, */*",
+        "Origin": "https://www.nasdaq.com",
+        "Referer": "https://www.nasdaq.com/market-activity/stocks",
+    }
     
     def __init__(self):
         # 初始化 finnhub 作为备选
@@ -60,6 +81,10 @@ class USStockDataSource(BaseDataSource):
                 logger.info("Finnhub client initialized")
         except Exception as e:
             logger.warning(f"Finnhub init failed: {e}")
+
+    def _normalize_timeframe(self, timeframe: str) -> str:
+        raw = str(timeframe or "1D").strip()
+        return self.TIMEFRAME_ALIASES.get(raw.lower(), raw)
     
     def get_ticker(self, symbol: str) -> Dict[str, Any]:
         """
@@ -100,6 +125,14 @@ class USStockDataSource(BaseDataSource):
                     logger.debug(f"Finnhub quote skipped (no access): {symbol}: {e}")
                 else:
                     logger.warning(f"Finnhub quote failed for {symbol}: {e}")
+
+        nasdaq_quote = self._fetch_nasdaq_quote(symbol)
+        if nasdaq_quote:
+            return nasdaq_quote
+
+        yahoo_quote = self._fetch_yahoo_chart_quote(symbol)
+        if yahoo_quote:
+            return yahoo_quote
         
         # 降级使用 yfinance
         try:
@@ -183,6 +216,7 @@ class USStockDataSource(BaseDataSource):
     ) -> List[Dict[str, Any]]:
         """获取美股K线数据"""
         klines = []
+        timeframe = self._normalize_timeframe(timeframe)
         
         try:
             interval = self.INTERVAL_MAP.get(timeframe, '1d')
@@ -205,9 +239,19 @@ class USStockDataSource(BaseDataSource):
             # logger.info(f"使用 yfinance 获取 {symbol}, 周期: {interval}, 日期: {start_date.date()} ~ {end_date.date()}")
             
             # 尝试 yfinance
-            df = self._fetch_yfinance(symbol, interval, start_date, end_date)
+            klines = self._fetch_yahoo_chart(symbol, interval, start_date, end_date, effective_limit)
+            if not klines:
+                if timeframe in ('1m', '3m', '5m', '15m', '30m', '1H', '4H'):
+                    klines = self._fetch_nasdaq_intraday_chart(symbol, timeframe, effective_limit)
+                else:
+                    klines = self._fetch_nasdaq_historical(symbol, start_date, end_date, effective_limit)
+                    if timeframe == '1W' and klines:
+                        klines = self._merge_every_n_sorted_bars(klines, 5)
+            df = None
+            if not klines:
+                df = self._fetch_yfinance(symbol, interval, start_date, end_date)
             
-            if df is None or df.empty:
+            if not klines and (df is None or df.empty):
                 # 尝试 finnhub
                 if self.finnhub_client and timeframe == '1D':
                     klines = self._fetch_finnhub(symbol, start_date, end_date, limit)
@@ -219,7 +263,7 @@ class USStockDataSource(BaseDataSource):
                             after_time,
                             truncate=(after_time is None),
                         )
-            else:
+            elif not klines:
                 klines = self._convert_dataframe(df, effective_limit)
                 if merge_factor > 1:
                     klines = self._merge_every_n_sorted_bars(klines, merge_factor)
@@ -242,6 +286,254 @@ class USStockDataSource(BaseDataSource):
             logger.error(traceback.format_exc())
         
         return klines
+
+    @staticmethod
+    def _parse_nasdaq_number(value, default: float = 0.0) -> float:
+        if value is None:
+            return default
+        try:
+            text = str(value).strip()
+            if not text or text in {"--", "N/A"}:
+                return default
+            text = text.replace("$", "").replace(",", "").replace("%", "").replace("+", "")
+            return float(text)
+        except Exception:
+            return default
+
+    def _fetch_nasdaq_quote(self, symbol: str) -> Optional[Dict[str, Any]]:
+        try:
+            resp = requests.get(
+                f"https://api.nasdaq.com/api/quote/{symbol}/info",
+                params={"assetclass": "stocks"},
+                timeout=10,
+                headers=self.NASDAQ_HEADERS,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+            primary = (((payload.get("data") or {}).get("primaryData")) or {})
+            if not primary:
+                return None
+
+            last_price = self._parse_nasdaq_number(primary.get("lastSalePrice"))
+            if last_price <= 0:
+                return None
+            change = self._parse_nasdaq_number(primary.get("netChange"))
+            change_pct = self._parse_nasdaq_number(primary.get("percentageChange"))
+            return {
+                "last": last_price,
+                "change": round(change, 4),
+                "changePercent": round(change_pct, 2),
+                "high": last_price,
+                "low": last_price,
+                "open": last_price,
+                "previousClose": round(last_price - change, 4) if change else 0,
+            }
+        except Exception as e:
+            logger.debug(f"Nasdaq quote failed for {symbol}: {e}")
+            return None
+
+    def _fetch_nasdaq_intraday_chart(
+        self,
+        symbol: str,
+        timeframe: str,
+        limit: int,
+    ) -> List[Dict[str, Any]]:
+        try:
+            resp = requests.get(
+                f"https://api.nasdaq.com/api/quote/{symbol}/chart",
+                params={"assetclass": "stocks"},
+                timeout=10,
+                headers=self.NASDAQ_HEADERS,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+            points = (((payload.get("data") or {}).get("chart")) or [])
+            bars: List[Dict[str, Any]] = []
+            for point in points:
+                ts_ms = point.get("x")
+                price = point.get("y")
+                if price is None:
+                    price = (point.get("z") or {}).get("value")
+                price_f = self._parse_nasdaq_number(price)
+                if not ts_ms or price_f <= 0:
+                    continue
+                ts = int(int(ts_ms) / 1000)
+                bars.append(self.format_kline(
+                    timestamp=ts,
+                    open_price=price_f,
+                    high=price_f,
+                    low=price_f,
+                    close=price_f,
+                    volume=0,
+                ))
+
+            if not bars:
+                return []
+            merge_n = {
+                "3m": 3,
+                "5m": 5,
+                "15m": 15,
+                "30m": 30,
+                "1H": 60,
+                "4H": 240,
+            }.get(timeframe, 1)
+            if merge_n > 1:
+                bars = self._merge_every_n_sorted_bars(bars, merge_n)
+            return bars[-limit:] if limit and len(bars) > limit else bars
+        except Exception as e:
+            logger.debug(f"Nasdaq intraday chart failed for {symbol}: {e}")
+            return []
+
+    def _fetch_nasdaq_historical(
+        self,
+        symbol: str,
+        start_date: datetime,
+        end_date: datetime,
+        limit: int,
+    ) -> List[Dict[str, Any]]:
+        try:
+            resp = requests.get(
+                f"https://api.nasdaq.com/api/quote/{symbol}/historical",
+                params={
+                    "assetclass": "stocks",
+                    "fromdate": start_date.strftime("%Y-%m-%d"),
+                    "todate": end_date.strftime("%Y-%m-%d"),
+                    "limit": max(int(limit or 100), 100),
+                },
+                timeout=12,
+                headers=self.NASDAQ_HEADERS,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+            rows = ((((payload.get("data") or {}).get("tradesTable")) or {}).get("rows")) or []
+            bars: List[Dict[str, Any]] = []
+            for row in rows:
+                try:
+                    dt = datetime.strptime(str(row.get("date")), "%m/%d/%Y")
+                    open_price = self._parse_nasdaq_number(row.get("open"))
+                    high = self._parse_nasdaq_number(row.get("high"))
+                    low = self._parse_nasdaq_number(row.get("low"))
+                    close = self._parse_nasdaq_number(row.get("close"))
+                    if min(open_price, high, low, close) <= 0:
+                        continue
+                    bars.append(self.format_kline(
+                        timestamp=int(dt.timestamp()),
+                        open_price=open_price,
+                        high=high,
+                        low=low,
+                        close=close,
+                        volume=self._parse_nasdaq_number(row.get("volume")),
+                    ))
+                except Exception:
+                    continue
+
+            bars.sort(key=lambda x: x["time"])
+            return bars[-limit:] if limit and len(bars) > limit else bars
+        except Exception as e:
+            logger.debug(f"Nasdaq historical failed for {symbol}: {e}")
+            return []
+
+    def _fetch_yahoo_chart_quote(self, symbol: str) -> Optional[Dict[str, Any]]:
+        try:
+            resp = requests.get(
+                f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}",
+                params={"range": "1d", "interval": "1m", "includePrePost": "false"},
+                timeout=8,
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+            result = ((payload.get("chart") or {}).get("result") or [None])[0]
+            if not result:
+                return None
+
+            meta = result.get("meta") or {}
+            quote = ((result.get("indicators") or {}).get("quote") or [{}])[0]
+            closes = [float(v) for v in (quote.get("close") or []) if v is not None]
+            opens = [float(v) for v in (quote.get("open") or []) if v is not None]
+            highs = [float(v) for v in (quote.get("high") or []) if v is not None]
+            lows = [float(v) for v in (quote.get("low") or []) if v is not None]
+
+            last_price = meta.get("regularMarketPrice") or (closes[-1] if closes else None)
+            prev_close = meta.get("chartPreviousClose") or meta.get("previousClose") or (opens[0] if opens else None)
+            if not last_price:
+                return None
+
+            last_price = float(last_price)
+            prev_close_f = float(prev_close) if prev_close else 0.0
+            change = last_price - prev_close_f if prev_close_f else 0.0
+            change_pct = (change / prev_close_f * 100) if prev_close_f else 0.0
+            return {
+                "last": last_price,
+                "change": round(change, 4),
+                "changePercent": round(change_pct, 2),
+                "high": max(highs) if highs else float(meta.get("regularMarketDayHigh") or last_price),
+                "low": min(lows) if lows else float(meta.get("regularMarketDayLow") or last_price),
+                "open": opens[0] if opens else float(meta.get("regularMarketOpen") or last_price),
+                "previousClose": prev_close_f,
+            }
+        except Exception as e:
+            logger.debug(f"Yahoo chart quote failed for {symbol}: {e}")
+            return None
+
+    def _fetch_yahoo_chart(
+        self,
+        symbol: str,
+        interval: str,
+        start_date: datetime,
+        end_date: datetime,
+        limit: int,
+    ) -> List[Dict[str, Any]]:
+        try:
+            resp = requests.get(
+                f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}",
+                params={
+                    "period1": int(start_date.timestamp()),
+                    "period2": int((end_date + timedelta(days=1)).timestamp()),
+                    "interval": interval,
+                    "includePrePost": "false",
+                    "events": "history",
+                },
+                timeout=10,
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+            result = ((payload.get("chart") or {}).get("result") or [None])[0]
+            if not result:
+                return []
+
+            timestamps = result.get("timestamp") or []
+            quote = ((result.get("indicators") or {}).get("quote") or [{}])[0]
+            opens = quote.get("open") or []
+            highs = quote.get("high") or []
+            lows = quote.get("low") or []
+            closes = quote.get("close") or []
+            volumes = quote.get("volume") or []
+
+            bars: List[Dict[str, Any]] = []
+            for i, ts in enumerate(timestamps):
+                try:
+                    open_price = opens[i]
+                    high = highs[i]
+                    low = lows[i]
+                    close = closes[i]
+                    if open_price is None or high is None or low is None or close is None:
+                        continue
+                    bars.append(self.format_kline(
+                        timestamp=int(ts),
+                        open_price=float(open_price),
+                        high=float(high),
+                        low=float(low),
+                        close=float(close),
+                        volume=float(volumes[i] or 0) if i < len(volumes) else 0,
+                    ))
+                except Exception:
+                    continue
+            return bars[-limit:] if limit and len(bars) > limit else bars
+        except Exception as e:
+            logger.debug(f"Yahoo chart kline failed for {symbol}: {e}")
+            return []
     
     def _fetch_yfinance(self, symbol: str, interval: str, start_date: datetime, end_date: datetime):
         """使用 yfinance 获取数据"""

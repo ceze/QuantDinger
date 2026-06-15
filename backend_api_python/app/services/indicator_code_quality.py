@@ -32,7 +32,7 @@ def _has_four_way_signals(code: str) -> bool:
 
 
 def _has_execution_signal_columns(code: str) -> bool:
-    return _has_df_buy_sell(code) or _has_four_way_signals(code)
+    return _has_four_way_signals(code)
 
 
 def _has_output_dict(code: str) -> bool:

@@ -31,8 +31,10 @@ def test_missing_stop_take_when_trading():
 my_indicator_name = "T"
 my_indicator_description = "D"
 df = df.copy()
-df['buy'] = True
-df['sell'] = True
+df['open_long'] = True
+df['close_long'] = False
+df['open_short'] = True
+df['close_short'] = False
 output = {'name': 'T', 'plots': [], 'signals': []}
 """
     hints = analyze_indicator_code_quality(code)
@@ -47,8 +49,10 @@ my_indicator_description = "D"
 # @strategy tradeDirection long
 # @strategy leverage 2
 df = df.copy()
-df['buy'] = False
-df['sell'] = False
+df['open_long'] = False
+df['close_long'] = False
+df['open_short'] = False
+df['close_short'] = False
 output = {'name': 'T', 'plots': [], 'signals': []}
 """
     hints = analyze_indicator_code_quality(code)

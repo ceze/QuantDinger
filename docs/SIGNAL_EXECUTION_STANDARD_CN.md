@@ -114,13 +114,14 @@ df['close_short'] = edge(raw_close_short)
 
 | 模式 | 脚本 | `# @strategy` | 说明 |
 |------|------|---------------|------|
-| **指标退出** | 输出 `close_*`（或两路中等价语义） | `trailingEnabled false`；`stopLossPct`/`takeProfitPct` 仅作灾难宽止损（可选） | 触及型、中轨/轨道 tp/sl |
-| **引擎退出** | 仅输出 `open_*` | `trailingEnabled` / `stopLossPct` / `takeProfitPct` 按需 | 简单趋势 |
-| **分层** | 指标 tp/sl + 引擎**宽**止损 | 文档写明优先级：指标优先，引擎仅兜底 | 需评审 |
+| **指标退出** `exit_owner: indicator` | 输出 `close_*`，或两路中明确等价的退出语义 | `trailingEnabled false`；不要依赖 `stopLossPct` / `takeProfitPct` / trailing | 触及型、中轨/轨道 tp/sl；当前实现会关闭服务端价格退出 |
+| **引擎退出** `exit_owner: engine` | 只输出入场，或只输出趋势反转用的结构性 `close_*` | `trailingEnabled` / `stopLossPct` / `takeProfitPct` 按需 | 固定止损止盈、追踪止损、简单趋势 |
 
 **MUST NOT**：指标内窄 tp/sl **且** `trailingEnabled true` 窄移动止损（易造成 `server_trailing_stop` 后再发 `close_*` → 数量为 0）。
 
 启用 trailing 时：**SHOULD** 关闭指标内同方向的 tp/sl 布尔列，或关闭 trailing。
+
+当前后端只支持 `exit_owner: indicator` 与 `exit_owner: engine`。不要生成或上架 `exit_owner: layered`；若确实需要“指标退出 + 引擎兜底”的混合方案，必须先产品评审并明确改造执行器语义。
 
 ---
 
@@ -185,7 +186,7 @@ df['close_short'] = edge(raw_close_short)
 ```python
 # --- QuantDinger execution contract (v1) ---
 # signal_form: four_way          # two_way | four_way
-# exit_owner: indicator          # indicator | engine | layered
+# exit_owner: indicator          # indicator | engine
 # flip_mode: R1                  # R1=close bar then open next bar | R2=same bar flip
 # tradeDirection: both
 # @strategy entryPct 1

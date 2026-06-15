@@ -70,4 +70,5 @@ def test_export_script_writes_yaml(tmp_path):
     )
     loaded = yaml.safe_load(out.read_text(encoding="utf-8"))
     assert loaded["openapi"].startswith("3.")
+    assert "x-api-app-version" not in loaded.get("info", {})
     assert "/health" in loaded["paths"]

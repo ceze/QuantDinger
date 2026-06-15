@@ -31,6 +31,14 @@ from app.config import APIKeys
 logger = get_logger(__name__)
 
 
+class NonBlockingThreadPoolExecutor(ThreadPoolExecutor):
+    """Thread pool that does not wait for slow optional data providers on exit."""
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.shutdown(wait=False, cancel_futures=True)
+        return False
+
+
 class MarketDataCollector:
     """
     市场数据采集器
@@ -121,7 +129,7 @@ class MarketDataCollector:
         }
         
         # === 阶段1: 核心数据 (并行获取) ===
-        with ThreadPoolExecutor(max_workers=4) as executor:
+        with NonBlockingThreadPoolExecutor(max_workers=4) as executor:
             core_futures = {
                 executor.submit(self._get_price, market, symbol): "price",
                 executor.submit(self._get_kline, market, symbol, timeframe, 60): "kline",
@@ -1790,7 +1798,7 @@ class MarketDataCollector:
             # 2) 如果没有缓存，快速并行获取关键指标
             logger.info("Fetching macro data from global_market functions")
             
-            with ThreadPoolExecutor(max_workers=4) as executor:
+            with NonBlockingThreadPoolExecutor(max_workers=4) as executor:
                 futures = {
                     executor.submit(_fetch_vix): "VIX",
                     executor.submit(_fetch_dollar_index): "DXY",

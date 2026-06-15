@@ -5,6 +5,7 @@ from __future__ import annotations
 import pandas as pd
 
 from app.services.backtest import BacktestService
+from app.services.builtin_indicators import _builtin_specs
 
 
 def _sample_df(n: int = 30) -> pd.DataFrame:
@@ -53,3 +54,14 @@ def test_execute_indicator_four_way_with_output_signals_no_buy_sell():
     assert "open_long" in out
     assert bool(out["open_long"].iloc[5])
     assert bool(out["close_long"].iloc[10])
+
+
+def test_builtin_indicator_sample_executes_with_four_way_contract():
+    svc = BacktestService()
+    df = _sample_df(120)
+    code = _builtin_specs()[0]["code"]
+    out = svc._execute_indicator(code, df, backtest_params={})
+    assert isinstance(out, dict)
+    for col in ("open_long", "close_long", "open_short", "close_short"):
+        assert col in out
+        assert len(out[col]) == len(df)

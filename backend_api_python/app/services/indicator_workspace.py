@@ -77,11 +77,10 @@ def get_indicator_authoring_contract() -> Dict[str, Any]:
         "required_fields": {
             "globals": ["my_indicator_name", "my_indicator_description"],
             "dataframe": "df = df.copy() at start",
-            "signals_four_way": [
+            "signals": [
                 "df['open_long']", "df['close_long']",
                 "df['open_short']", "df['close_short']",
             ],
-            "signals_legacy": ["df['buy']", "df['sell']"],
             "output": "output = {'name', 'plots', 'signals'} with list lengths == len(df)",
             "params": "every # @param must be read via params.get('name', default)",
             "strategy_annotations": "# @strategy entryPct 1  (0-1 ratio, 1 = 100%)",
@@ -90,7 +89,7 @@ def get_indicator_authoring_contract() -> Dict[str, Any]:
             "Natural language in backtest `code` field",
             "import os/sys/requests/subprocess",
             "Chaining .rolling/.shift on np.where output without pd.Series(..., index=df.index)",
-            "Using df['sell'] for close-only exits when tradeDirection is both",
+            "Using legacy df['buy']/df['sell'] for newly generated code",
         ],
         "starter_template": template,
         "minimal_backtest_snippet": (

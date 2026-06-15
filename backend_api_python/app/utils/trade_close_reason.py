@@ -56,7 +56,7 @@ _LABELS_ZH: Dict[str, str] = {
     GRID_OUT_OF_BOUNDS_DOWN: "网格下轨突破平仓",
     SERVER_STOP_LOSS: "止损平仓",
     SERVER_TAKE_PROFIT: "止盈平仓",
-    SERVER_TRAILING_STOP: "移动止盈平仓",
+    SERVER_TRAILING_STOP: "追踪止损平仓",
     INDICATOR_SIGNAL: "信号触发平仓",
     LEGACY_SIGNAL_TRIGGER: "信号触发平仓",
 }
