@@ -49,9 +49,63 @@ class MetaFinnhubConfig(type):
     def RATE_LIMIT_PERIOD(cls):
         return 60
 
+    @property
+    def FREE_ONLY(cls):
+        from app.utils.config_loader import load_addon_config
+        val = load_addon_config().get('finnhub', {}).get('free_only')
+        if val is None:
+            val = os.getenv('FINNHUB_FREE_ONLY', 'true')
+        return str(val).strip().lower() not in ('0', 'false', 'no', 'off')
+
 
 class FinnhubConfig(metaclass=MetaFinnhubConfig):
     """Finnhub 数据源配置"""
+    pass
+
+
+class MetaTradingEconomicsConfig(type):
+    @property
+    def BASE_URL(cls):
+        from app.utils.config_loader import load_addon_config
+        val = load_addon_config().get('tradingeconomics', {}).get('base_url')
+        return (val or os.getenv('TRADING_ECONOMICS_BASE_URL', 'https://api.tradingeconomics.com')).rstrip('/')
+
+    @property
+    def CLIENT(cls):
+        from app.utils.config_loader import load_addon_config
+        val = load_addon_config().get('tradingeconomics', {}).get('client')
+        return val or os.getenv('TRADING_ECONOMICS_CLIENT', '')
+
+    @property
+    def KEY(cls):
+        from app.utils.config_loader import load_addon_config
+        val = load_addon_config().get('tradingeconomics', {}).get('key')
+        return val or os.getenv('TRADING_ECONOMICS_KEY', '')
+
+    @property
+    def TIMEOUT(cls):
+        from app.utils.config_loader import load_addon_config
+        val = load_addon_config().get('tradingeconomics', {}).get('timeout')
+        return int(val) if val is not None else int(os.getenv('TRADING_ECONOMICS_TIMEOUT', 10))
+
+    @property
+    def CREDENTIALS(cls):
+        client = str(cls.CLIENT or '').strip()
+        key = str(cls.KEY or '').strip()
+        if ':' in client and not key:
+            return client
+        if not client or not key:
+            return ''
+        return f"{client}:{key}"
+
+    @property
+    def CONFIGURED(cls):
+        credentials = str(cls.CREDENTIALS or '').strip().lower()
+        return bool(credentials and credentials not in ('guest', 'guest:guest'))
+
+
+class TradingEconomicsConfig(metaclass=MetaTradingEconomicsConfig):
+    """Trading Economics calendar configuration."""
     pass
 
 

@@ -34,12 +34,12 @@ class LLMProvider(Enum):
 PROVIDER_CONFIGS = {
     LLMProvider.OPENROUTER: {
         "base_url": "https://openrouter.ai/api/v1",
-        "default_model": "openai/gpt-4o",
+        "default_model": "openai/gpt-5.4",
         "fallback_model": "openai/gpt-4o-mini",
     },
     LLMProvider.OPENAI: {
         "base_url": "https://api.openai.com/v1",
-        "default_model": "gpt-4o",
+        "default_model": "gpt-5.4",
         "fallback_model": "gpt-4o-mini",
     },
     LLMProvider.GOOGLE: {
@@ -59,7 +59,7 @@ PROVIDER_CONFIGS = {
     },
     LLMProvider.ATLASCLOUD: {
         "base_url": "https://api.atlascloud.ai/v1",
-        "default_model": "deepseek-v3",
+        "default_model": "openai/gpt-5.4",
         "fallback_model": "deepseek-v3",
     },
     LLMProvider.CUSTOM: {
@@ -74,7 +74,7 @@ PROVIDER_CONFIGS = {
     },
     LLMProvider.LITELLM: {
         "base_url": "",  # LiteLLM SDK handles routing
-        "default_model": "gpt-4o-mini",
+        "default_model": "openai/gpt-5.4",
         "fallback_model": "gpt-4o-mini",
     },
 }
@@ -280,12 +280,29 @@ class LLMService:
             role = msg["role"]
             content = msg["content"]
             
+            parts = []
+            if isinstance(content, list):
+                for item in content:
+                    if not isinstance(item, dict):
+                        continue
+                    if item.get("type") == "text":
+                        parts.append({"text": str(item.get("text") or "")})
+                    elif item.get("type") == "image_url":
+                        image_url = item.get("image_url") or {}
+                        data_url = image_url.get("url") if isinstance(image_url, dict) else None
+                        if data_url and data_url.startswith("data:image/") and ";base64," in data_url:
+                            header, b64 = data_url.split(",", 1)
+                            mime_type = header.replace("data:", "").split(";", 1)[0]
+                            parts.append({"inline_data": {"mime_type": mime_type, "data": b64}})
+            else:
+                parts.append({"text": str(content or "")})
+
             if role == "system":
-                system_instruction = content
+                system_instruction = str(content or "") if not isinstance(content, list) else ""
             elif role == "user":
-                contents.append({"role": "user", "parts": [{"text": content}]})
+                contents.append({"role": "user", "parts": parts or [{"text": ""}]})
             elif role == "assistant":
-                contents.append({"role": "model", "parts": [{"text": content}]})
+                contents.append({"role": "model", "parts": parts or [{"text": ""}]})
         
         data = {
             "contents": contents,
@@ -353,11 +370,61 @@ class LLMService:
         else:
             raise ValueError("LiteLLM response is missing 'choices'")
 
+    def _stream_openai_compatible(self, messages: list, model: str, temperature: float,
+                                  api_key: str, base_url: str, timeout: int):
+        """Stream text deltas from an OpenAI-compatible chat endpoint."""
+        url = f"{base_url}/chat/completions"
+        headers = {"Content-Type": "application/json"}
+        if (api_key or "").strip():
+            headers["Authorization"] = f"Bearer {api_key.strip()}"
+        if "openrouter" in base_url:
+            headers["HTTP-Referer"] = "https://quantdinger.com"
+            headers["X-Title"] = "QuantDinger Analysis"
+
+        data = {
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "stream": True,
+        }
+        response = requests.post(url, headers=headers, json=data, timeout=timeout, stream=True)
+        if response.status_code >= 400:
+            err_text = ""
+            try:
+                err = response.json().get("error")
+                err_text = err.get("message") if isinstance(err, dict) else str(err or "")
+            except Exception:
+                err_text = (response.text or "").strip()[:300]
+            raise ValueError(f"LLM API {response.status_code}: {err_text}".strip())
+
+        for raw_line in response.iter_lines(decode_unicode=False):
+            if not raw_line:
+                continue
+            if isinstance(raw_line, bytes):
+                line = raw_line.decode("utf-8", errors="replace").strip()
+            else:
+                line = str(raw_line).strip()
+            if line.startswith("data:"):
+                line = line[5:].strip()
+            if line == "[DONE]":
+                break
+            try:
+                payload = json.loads(line)
+            except Exception:
+                continue
+            choices = payload.get("choices") or []
+            if not choices:
+                continue
+            delta = choices[0].get("delta") or {}
+            content = delta.get("content")
+            if content:
+                yield content
+
     def _normalize_model_for_provider(self, model: str, provider: LLMProvider) -> str:
         """
         Normalize model name for the target provider.
         
-        Frontend may send OpenRouter-style model names (e.g., 'openai/gpt-4o').
+        Frontend may send OpenRouter-style model names (e.g., 'openai/gpt-5.4').
         This converts them to the correct format for each provider.
         """
         if not model:
@@ -365,12 +432,23 @@ class LLMService:
         
         model = model.strip()
         
-        # LiteLLM and OpenRouter use provider/model format natively
+        # LiteLLM and OpenRouter use provider/model format natively.
         if provider in (LLMProvider.OPENROUTER, LLMProvider.LITELLM):
+            return model
+
+        # AtlasCloud is OpenAI-compatible and may expose routed model ids such
+        # as openai/gpt-5.4. Keep third-party prefixes intact, while still
+        # accepting atlascloud/model as a convenience alias.
+        if provider == LLMProvider.ATLASCLOUD:
+            if '/' in model:
+                prefix, actual_model = model.split('/', 1)
+                if prefix.lower() in ('atlascloud', 'atlas'):
+                    return actual_model
+                return model
             return model
         
         # For direct providers, extract the model name from OpenRouter format
-        # e.g., 'openai/gpt-4o' -> 'gpt-4o'
+        # e.g., 'openai/gpt-5.4' -> 'gpt-5.4'
         #       'google/gemini-1.5-flash' -> 'gemini-1.5-flash'
         #       'deepseek/deepseek-chat' -> 'deepseek-chat'
         #       'x-ai/grok-beta' -> 'grok-beta'
@@ -397,7 +475,7 @@ class LLMService:
                 return actual_model
             
             # If model prefix doesn't match current provider, use provider's default model
-            # This prevents sending 'gpt-4o' to DeepSeek, etc.
+            # This prevents sending a wrong provider's model name to DeepSeek, etc.
             logger.warning(f"Model '{model}' doesn't match provider '{provider.value}', using default model")
             return self.get_default_model(provider)
         
@@ -438,7 +516,7 @@ class LLMService:
         
         Args:
             messages: List of message dicts with 'role' and 'content'
-            model: Model name (uses provider default if not specified). Supports OpenRouter format (e.g., 'openai/gpt-4o')
+            model: Model name (uses provider default if not specified). Supports OpenRouter format (e.g., 'openai/gpt-5.4')
             temperature: Sampling temperature
             use_fallback: Whether to try fallback model on failure
             provider: Override the service's default provider
@@ -594,6 +672,26 @@ class LLMService:
         
         logger.error(error_msg)
         raise Exception(error_msg)
+
+    def stream_llm_api(self, messages: list, model: str = None, temperature: float = 0.7):
+        """Stream LLM response deltas for providers with OpenAI-compatible streaming."""
+        p = self.provider
+        api_key = (self.get_api_key(p) or "").strip()
+        base_url = (self.get_base_url(p) or "").strip()
+        custom_ok_without_key = (p == LLMProvider.CUSTOM and bool(base_url))
+        if not api_key and not custom_ok_without_key:
+            raise ValueError(f"API key not configured for provider: {p.value}. Please set {p.value.upper()}_API_KEY in settings.")
+        if p == LLMProvider.GOOGLE:
+            yield self.call_llm_api(messages, model=model, temperature=temperature, use_json_mode=False)
+            return
+        if p == LLMProvider.LITELLM:
+            yield self.call_llm_api(messages, model=model, temperature=temperature, use_json_mode=False)
+            return
+
+        model = self._normalize_model_for_provider(model, p)
+        config = load_addon_config()
+        timeout = int(config.get(p.value, {}).get('timeout', 120))
+        yield from self._stream_openai_compatible(messages, model, temperature, api_key, base_url, timeout)
     
     def _try_alternative_providers(self, messages: list, model: str, temperature: float,
                                   use_json_mode: bool, excluded_provider: LLMProvider = None) -> str:

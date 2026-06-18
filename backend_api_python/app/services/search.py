@@ -120,14 +120,11 @@ class BaseSearchProvider(ABC):
         if not self._key_cycle:
             return None
         
-        # 最多尝试所有 key
         for _ in range(len(self._api_keys)):
             key = next(self._key_cycle)
-            # 跳过错误次数过多的 key（超过 3 次）
             if self._key_errors.get(key, 0) < 3:
                 return key
         
-        # 所有 key 都有问题，重置错误计数并返回第一个
         logger.warning(f"[{self._name}] 所有 API Key 都有错误记录，重置错误计数")
         self._key_errors = {key: 0 for key in self._api_keys}
         return self._api_keys[0] if self._api_keys else None
@@ -135,7 +132,6 @@ class BaseSearchProvider(ABC):
     def _record_success(self, key: str) -> None:
         """记录成功使用"""
         self._key_usage[key] = self._key_usage.get(key, 0) + 1
-        # 成功后减少错误计数
         if key in self._key_errors and self._key_errors[key] > 0:
             self._key_errors[key] -= 1
     
@@ -228,13 +224,11 @@ class TavilySearchProvider(BaseSearchProvider):
         try:
             from tavily import TavilyClient
         except ImportError:
-            # 如果未安装 tavily-python，使用 REST API
             return self._do_search_rest(query, api_key, max_results, days)
         
         try:
             client = TavilyClient(api_key=api_key)
             
-            # 执行搜索
             response = client.search(
                 query=query,
                 search_depth="advanced",
@@ -244,7 +238,6 @@ class TavilySearchProvider(BaseSearchProvider):
                 days=days,
             )
             
-            # 解析结果
             results = []
             for item in response.get('results', []):
                 results.append(SearchResult(
@@ -495,7 +488,6 @@ class GoogleSearchProvider(BaseSearchProvider):
                 'num': min(max_results, 10),
             }
             
-            # 添加时间限制
             if days <= 1:
                 params['dateRestrict'] = 'd1'
             elif days <= 7:
@@ -608,7 +600,6 @@ class DuckDuckGoSearchProvider(BaseSearchProvider):
     def _do_search(self, query: str, api_key: str, max_results: int, days: int = 7) -> SearchResponse:
         """执行 DuckDuckGo 搜索"""
         try:
-            # 使用 DuckDuckGo Instant Answer API
             url = "https://api.duckduckgo.com/"
             params = {
                 'q': query,
@@ -623,7 +614,6 @@ class DuckDuckGoSearchProvider(BaseSearchProvider):
             
             results = []
             
-            # 获取 RelatedTopics
             related_topics = data.get('RelatedTopics', [])
             for topic in related_topics[:max_results]:
                 if isinstance(topic, dict):
@@ -646,7 +636,6 @@ class DuckDuckGoSearchProvider(BaseSearchProvider):
                                     source='DuckDuckGo',
                                 ))
             
-            # 检查 AbstractURL
             if data.get('AbstractURL') and len(results) < max_results:
                 results.insert(0, SearchResult(
                     title=data.get('Heading', query),
@@ -655,7 +644,6 @@ class DuckDuckGoSearchProvider(BaseSearchProvider):
                     source='DuckDuckGo',
                 ))
             
-            # 如果没有结果，尝试 HTML 版本
             if not results:
                 results = self._search_html(query, max_results)
             
@@ -740,7 +728,6 @@ class SearchService:
         """初始化搜索引擎（按优先级排序）"""
         from app.config import APIKeys
         
-        # 1. Tavily（AI优化搜索）
         tavily_keys = APIKeys.TAVILY_API_KEYS
         if tavily_keys:
             self._providers.append(TavilySearchProvider(tavily_keys))
@@ -765,7 +752,6 @@ class SearchService:
             self._providers.append(BingSearchProvider(bing_api_key))
             logger.info("已配置 Bing 搜索")
         
-        # 5. DuckDuckGo（免费兜底）
         self._providers.append(DuckDuckGoSearchProvider())
         logger.info("已配置 DuckDuckGo 搜索（免费兜底）")
         
@@ -776,6 +762,32 @@ class SearchService:
     def is_available(self) -> bool:
         """检查是否有可用的搜索引擎"""
         return any(p.is_available for p in self._providers)
+
+    def provider_status(self) -> List[Dict[str, Any]]:
+        """Return configured search provider diagnostics for agent context."""
+        from app.config import APIKeys
+
+        google_cfg = self._config.get('google', {}) if isinstance(self._config, dict) else {}
+        bing_cfg = self._config.get('bing', {}) if isinstance(self._config, dict) else {}
+        configured = {
+            "Google": bool(google_cfg.get('api_key') and google_cfg.get('cx')),
+            "Bing": bool(bing_cfg.get('api_key')),
+            "Tavily": bool(APIKeys.TAVILY_API_KEYS),
+            "SerpAPI": bool(APIKeys.SERPAPI_KEYS),
+            "DuckDuckGo": True,
+        }
+        active_names = {provider.name for provider in self._providers}
+        active_available = {provider.name: provider.is_available for provider in self._providers}
+        return [
+            {
+                "provider": name,
+                "configured": bool(configured.get(name)),
+                "registered": name in active_names,
+                "available": bool(active_available.get(name)),
+                "note": _search_provider_note(name, bool(configured.get(name)), name in active_names),
+            }
+            for name in ("Google", "Bing", "Tavily", "SerpAPI", "DuckDuckGo")
+        ]
     
     def search(self, query: str, num_results: int = None, date_restrict: str = None, days: int = 7) -> List[Dict[str, Any]]:
         """
@@ -792,7 +804,6 @@ class SearchService:
         """
         limit = num_results if num_results else self.max_results
         
-        # 解析 date_restrict 为 days
         if date_restrict and not days:
             if date_restrict.startswith('d'):
                 days = int(date_restrict[1:])
@@ -816,7 +827,6 @@ class SearchService:
         Returns:
             SearchResponse 对象
         """
-        # 依次尝试各个搜索引擎
         for provider in self._providers:
             if not provider.is_available:
                 continue
@@ -828,7 +838,6 @@ class SearchService:
             else:
                 logger.warning(f"{provider.name} 搜索失败: {response.error_message}，尝试下一个引擎")
         
-        # 所有引擎都失败
         return SearchResponse(
             query=query,
             results=[],
@@ -856,7 +865,6 @@ class SearchService:
         Returns:
             SearchResponse 对象
         """
-        # 智能确定搜索时间范围
         today_weekday = datetime.now().weekday()
         if today_weekday == 0:  # 周一
             search_days = 3
@@ -865,7 +873,6 @@ class SearchService:
         else:
             search_days = 1
         
-        # 根据市场类型构建搜索查询
         if market == "USStock":
             query = f"{stock_name} {stock_code} stock news latest"
         elif market == "Crypto":
@@ -897,7 +904,6 @@ class SearchService:
         return self.search_with_fallback(query, max_results=5, days=30)
 
 
-# 单例实例
 _search_service: Optional[SearchService] = None
 
 
@@ -907,6 +913,21 @@ def get_search_service() -> SearchService:
     if _search_service is None:
         _search_service = SearchService()
     return _search_service
+
+
+def _search_provider_note(name: str, configured: bool, registered: bool) -> str:
+    """Describe why a search provider can or cannot be used."""
+    if name == "Google" and not configured:
+        return "Set SEARCH_GOOGLE_API_KEY and SEARCH_GOOGLE_CX to enable Google Custom Search fallback."
+    if name == "Bing" and not configured:
+        return "Set SEARCH_BING_API_KEY to enable Bing fallback."
+    if name == "Tavily" and not configured:
+        return "Set TAVILY_API_KEYS to enable Tavily AI search."
+    if name == "SerpAPI" and not configured:
+        return "Set SERPAPI_KEYS to enable SerpAPI Google/Bing search."
+    if configured and not registered:
+        return "Configured but not registered by the current search service instance; restart backend."
+    return "ready" if configured or name == "DuckDuckGo" else "not configured"
 
 
 def reset_search_service() -> None:
