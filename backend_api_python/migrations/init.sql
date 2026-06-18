@@ -294,6 +294,27 @@ CREATE INDEX IF NOT EXISTS idx_strategies_user_id ON qd_strategies_trading(user_
 CREATE INDEX IF NOT EXISTS idx_strategies_status ON qd_strategies_trading(status);
 CREATE INDEX IF NOT EXISTS idx_strategies_group_id ON qd_strategies_trading(strategy_group_id);
 
+-- Script source library: reusable code assets separated from live/runtime strategy rows.
+CREATE TABLE IF NOT EXISTS qd_script_sources (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES qd_users(id) ON DELETE CASCADE,
+    name VARCHAR(255) NOT NULL,
+    description TEXT DEFAULT '',
+    code TEXT NOT NULL DEFAULT '',
+    template_key VARCHAR(80) DEFAULT '',
+    param_schema JSONB DEFAULT '{}'::jsonb,
+    source_marketplace_indicator_id INTEGER,
+    source_script_source_id INTEGER,
+    visibility VARCHAR(32) DEFAULT 'private',
+    status VARCHAR(32) DEFAULT 'draft',
+    metadata JSONB DEFAULT '{}'::jsonb,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_script_sources_user_id ON qd_script_sources(user_id);
+CREATE INDEX IF NOT EXISTS idx_script_sources_marketplace ON qd_script_sources(source_marketplace_indicator_id);
+
 -- Add strategy_mode and strategy_code columns (script strategy support)
 DO $$
 BEGIN

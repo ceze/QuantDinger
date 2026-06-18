@@ -11,18 +11,8 @@
   <div align="center" style="max-width: 680px; margin: 1.25rem auto 0; padding: 20px 22px 22px; border: 1px solid #d1d9e0; border-radius: 16px;">
     <p style="margin: 0 0 14px; line-height: 1.65;">
       <a href="../README.md"><strong>English</strong></a>
-      <span style="color: #afb8c1;"> · </span>
-      <a href="README_CN.md"><strong>简体中文</strong></a>
-      <span style="color: #afb8c1;"> · </span>
-      <a href="README_JA.md"><strong>日本語</strong></a>
-      <span style="color: #afb8c1;"> · </span>
-      <a href="README_KO.md"><strong>한국어</strong></a>
-      <span style="color: #afb8c1;"> · </span>
-      <a href="README_TH.md"><strong>ไทย</strong></a>
-      <span style="color: #afb8c1;"> · </span>
-      <a href="README_VI.md"><strong>Tiếng Việt</strong></a>
-      <span style="color: #afb8c1;"> · </span>
-      <a href="README_AR.md"><strong>العربية</strong></a>
+      <span style="color: #afb8c1;"> / </span>
+      <a href="README_CN.md"><strong>Chinese</strong></a>
     </p>
     <p style="margin: 0 0 18px; padding-bottom: 16px; border-bottom: 1px solid #eaeef2; line-height: 2;">
       <a href="https://ai.quantdinger.com"><strong>SaaS</strong></a>
@@ -87,7 +77,7 @@ curl -fsSL https://raw.githubusercontent.com/brokermr810/QuantDinger/main/instal
 
 默认安装到 `~/quantdinger`（自定义：`… | bash -s -- /opt/quantdinger`）。重复执行同一命令可拉取最新镜像并重启。
 
-然后打开 **`http://localhost:8888`**，使用 **`quantdinger` / `123456`** 登录，并**修改默认管理员密码**。
+然后打开 **`http://localhost:8888`**，使用安装器中输入的管理员账号和密码登录。
 
 <details>
 <summary><b>Windows、手动克隆或镜像加速排错</b></summary>
@@ -436,7 +426,7 @@ docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 默认管理员（生产环境请立即修改）：
 
 - 用户名：`quantdinger`
-- 密码：`123456`（来自 `env.example`；也可在首次登录前于 `.env` 中设置 `ADMIN_USER` / `ADMIN_PASSWORD`）
+- 密码：使用一行安装器时为安装过程中输入的密码；手动部署时读取 `.env` 中的 `ADMIN_PASSWORD`。
 
 如果 `ADMIN_PASSWORD` 不是 `123456`，系统会认为默认管理员已安全初始化，不再弹出首次改密提醒；如果旧数据库里仍保存着 `123456`，后端启动时会把首个管理员密码同步为当前 `.env` 的非默认值。
 
@@ -451,7 +441,7 @@ AtlasCloud 也已作为 OpenAI-compatible 供应商接入。参考官方 [AtlasC
 ```env
 LLM_PROVIDER=atlascloud
 ATLASCLOUD_API_KEY=your_api_key
-ATLASCLOUD_MODEL=deepseek-v3
+ATLASCLOUD_MODEL=openai/gpt-5.4
 ATLASCLOUD_BASE_URL=https://api.atlascloud.ai/v1
 ```
 
@@ -629,10 +619,12 @@ QuantDinger/
 | 计费 | `BILLING_ENABLED`、`BILLING_COST_AI_ANALYSIS` |
 | 会员 | `MEMBERSHIP_MONTHLY_PRICE_USD`、`MEMBERSHIP_MONTHLY_CREDITS` |
 | USDT 支付 | `USDT_PAY_ENABLED`、`USDT_TRC20_XPUB`、`TRONGRID_API_KEY` |
-| 可选行情 API | `TWELVE_DATA_API_KEY`、`FINNHUB_API_KEY`、`TIINGO_API_KEY`、`ADANOS_API_KEY` |
+| 可选行情 API | `TWELVE_DATA_API_KEY`、`FINNHUB_API_KEY`、`TIINGO_API_KEY`、`TRADING_ECONOMICS_CLIENT`、`TRADING_ECONOMICS_KEY`、`ADANOS_API_KEY` |
 | 代理 | `PROXY_URL` |
 | 后台工作进程 | `ENABLE_PENDING_ORDER_WORKER`、`ENABLE_PORTFOLIO_MONITOR`、`ENABLE_REFLECTION_WORKER` |
 | AI 调优 | `ENABLE_AI_ENSEMBLE`、`ENABLE_CONFIDENCE_CALIBRATION`、`AI_ENSEMBLE_MODELS` |
+
+财经日历采用免费优先策略：默认使用无需 Key 的 AkShare/WallstreetCN 日历兜底源；如果你配置了 Trading Economics 正式凭证，则优先使用该国际日历源。Finnhub 的付费日历和社交情绪端点默认不会调用；只有在确认账号套餐支持后，才需要设置 `FINNHUB_FREE_ONLY=false`。
 
 ## 文档导航
 
@@ -642,12 +634,11 @@ QuantDinger/
 | [API 约定](API_CONVENTIONS.md) | 认证、响应封装、可见性分级 |
 | [更新日志](CHANGELOG.md) | 版本历史与迁移说明 |
 | [英文总览](../README.md) | 仓库根目录英文 README（与本文结构同步） |
-| [日本語](README_JA.md) · [한국어](README_KO.md) · [ไทย](README_TH.md) · [Tiếng Việt](README_VI.md) · [العربية](README_AR.md) | 精简版多语言 README（与英文/中文互补；深度说明仍以英文或本文为准） |
 | [多用户部署](multi-user-setup.md) | PostgreSQL 多用户部署 |
 | [云服务器部署](CLOUD_DEPLOYMENT_CN.md) | 域名、HTTPS、反向代理与生产部署 |
 | [Agent 环境设计](agent/AGENT_ENVIRONMENT_DESIGN.md) · [AI / Agent 集成](agent/AI_INTEGRATION_DESIGN.md) · [快速开始](agent/AGENT_QUICKSTART.md) · [OpenAPI](agent/agent-openapi.json) · [MCP 说明](../mcp_server/README.md) | 编码 Agent、网关、MCP（PyPI：`quantdinger-mcp`）；部分正文为英文 |
 
-**策略：** [EN](STRATEGY_DEV_GUIDE.md) · [CN](STRATEGY_DEV_GUIDE_CN.md) · [TW](STRATEGY_DEV_GUIDE_TW.md) · [JA](STRATEGY_DEV_GUIDE_JA.md) · [KO](STRATEGY_DEV_GUIDE_KO.md) · [跨品种 EN](CROSS_SECTIONAL_STRATEGY_GUIDE_EN.md) / [CN](CROSS_SECTIONAL_STRATEGY_GUIDE_CN.md) · [示例](examples/)
+**策略：** [EN](STRATEGY_DEV_GUIDE.md) · [CN](STRATEGY_DEV_GUIDE_CN.md) · [跨品种 EN](CROSS_SECTIONAL_STRATEGY_GUIDE_EN.md) / [CN](CROSS_SECTIONAL_STRATEGY_GUIDE_CN.md) · [示例](examples/)
 
 **集成与通知：** [IBKR](IBKR_TRADING_GUIDE_EN.md) · [MT5 EN](MT5_TRADING_GUIDE_EN.md) / [CN](MT5_TRADING_GUIDE_CN.md) · [OAuth EN](OAUTH_CONFIG_EN.md) / [CN](OAUTH_CONFIG_CN.md) · Telegram / Email / SMS：同目录下 `NOTIFICATION_*` 配置文件（中/英文件名见各文档标题）。
 

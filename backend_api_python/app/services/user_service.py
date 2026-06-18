@@ -508,7 +508,6 @@ class UserService:
         try:
             with get_db_connection() as db:
                 cur = db.cursor()
-                # 递增 token_version
                 cur.execute(
                     """
                     UPDATE qd_users 
@@ -519,7 +518,6 @@ class UserService:
                 )
                 db.commit()
                 
-                # 获取新的 token_version
                 cur.execute(
                     "SELECT token_version FROM qd_users WHERE id = ?",
                     (user_id,)

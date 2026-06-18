@@ -191,7 +191,6 @@ class APIKeys(metaclass=MetaAPIKeys):
     @classmethod
     def get(cls, key_name: str, default: str = '') -> str:
         """获取 API 密钥"""
-        # 尝试从类属性获取
         if hasattr(cls, key_name):
             return getattr(cls, key_name)
         return default
