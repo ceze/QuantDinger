@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from io import BytesIO
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -31,7 +32,9 @@ from app.services.ai_tool_registry import build_tool_prompt, public_tool_registr
 from app.services.kline import KlineService
 from app.services.llm import LLMService
 from app.services.search import get_search_service
+from app.config.data_sources import AkshareConfig, TradingEconomicsConfig
 from app.data.market_symbols_seed import search_symbols as seed_search_symbols
+from app.data_providers.macro_series import get_macro_series_provider
 from app.data_providers.news import get_economic_calendar_payload
 from app.utils.auth import admin_required, login_required
 from app.utils.db import get_db_connection
@@ -54,8 +57,25 @@ def _json_dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
+def _plain_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list, tuple)):
+        return json.dumps(value, ensure_ascii=False)
+    return str(value)
+
+
 def _row_to_dict(row: Any) -> dict:
     return dict(row or {})
+
+
+def _json_loads(value: Any, default: Any = None) -> Any:
+    if value is None or value == "":
+        return default
+    try:
+        return json.loads(value)
+    except Exception:
+        return default
 
 
 def _get_user_memories(cur, user_id: int, limit: int = 12) -> list[dict]:
@@ -125,6 +145,10 @@ def _ensure_tables(cur) -> None:
             content TEXT NOT NULL,
             attachments_json TEXT,
             actions_json TEXT,
+            report_json TEXT,
+            report_target_json TEXT,
+            report_error TEXT,
+            report_error_tone VARCHAR(32),
             intent VARCHAR(48),
             created_at TIMESTAMP DEFAULT NOW()
         )
@@ -160,14 +184,30 @@ def _ensure_tables(cur) -> None:
         )
         """
     )
-    try:
-        cur.execute("ALTER TABLE qd_ai_copilot_messages ADD COLUMN IF NOT EXISTS actions_json TEXT")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_qd_ai_copilot_sessions_user ON qd_ai_copilot_sessions(user_id, updated_at)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_qd_ai_copilot_messages_session ON qd_ai_copilot_messages(session_id, id)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_qd_ai_user_memories_user ON qd_ai_user_memories(user_id, is_active, updated_at)")
-    except Exception:
-        # SQLite compatibility in older local deployments.
-        pass
+    for ddl in (
+        "ALTER TABLE qd_ai_copilot_messages ADD COLUMN IF NOT EXISTS actions_json TEXT",
+        "ALTER TABLE qd_ai_copilot_messages ADD COLUMN IF NOT EXISTS report_json TEXT",
+        "ALTER TABLE qd_ai_copilot_messages ADD COLUMN IF NOT EXISTS report_target_json TEXT",
+        "ALTER TABLE qd_ai_copilot_messages ADD COLUMN IF NOT EXISTS report_error TEXT",
+        "ALTER TABLE qd_ai_copilot_messages ADD COLUMN IF NOT EXISTS report_error_tone VARCHAR(32)",
+    ):
+        try:
+            cur.execute(ddl)
+        except Exception:
+            try:
+                cur.execute(ddl.replace(" IF NOT EXISTS", ""))
+            except Exception:
+                # SQLite compatibility in older local deployments.
+                pass
+    for ddl in (
+        "CREATE INDEX IF NOT EXISTS idx_qd_ai_copilot_sessions_user ON qd_ai_copilot_sessions(user_id, updated_at)",
+        "CREATE INDEX IF NOT EXISTS idx_qd_ai_copilot_messages_session ON qd_ai_copilot_messages(session_id, id)",
+        "CREATE INDEX IF NOT EXISTS idx_qd_ai_user_memories_user ON qd_ai_user_memories(user_id, is_active, updated_at)",
+    ):
+        try:
+            cur.execute(ddl)
+        except Exception:
+            pass
 
 
 def _title_from_message(message: str) -> str:
@@ -427,10 +467,18 @@ def _normalize_attachments(raw_attachments: Any) -> list[dict]:
 
 
 def _attachment_meta(attachments: list[dict]) -> list[dict]:
-    return [
-        {"name": a.get("name"), "mime_type": a.get("mime_type"), "size": a.get("size")}
-        for a in attachments
-    ]
+    stored: list[dict] = []
+    for a in attachments:
+        item = {
+            "name": a.get("name"),
+            "mime_type": a.get("mime_type"),
+            "size": a.get("size"),
+        }
+        data_url = a.get("data_url")
+        if isinstance(data_url, str) and data_url.startswith("data:image/"):
+            item["data_url"] = data_url
+        stored.append(item)
+    return stored
 
 
 def _get_session(cur, user_id: int, session_id: int | None) -> dict | None:
@@ -466,12 +514,25 @@ def _create_session(cur, user_id: int, title: str, context: dict) -> int:
     return int(row["id"] if isinstance(row, dict) else row[0])
 
 
-def _insert_message(cur, session_id: int, user_id: int, role: str, content: str, attachments: list[dict], intent: str, actions: list[dict] | None = None) -> int:
+def _insert_message(
+    cur,
+    session_id: int,
+    user_id: int,
+    role: str,
+    content: str,
+    attachments: list[dict],
+    intent: str,
+    actions: list[dict] | None = None,
+    report: dict | None = None,
+    report_target: dict | None = None,
+    report_error: str | None = None,
+    report_error_tone: str | None = None,
+) -> int:
     cur.execute(
         """
         INSERT INTO qd_ai_copilot_messages
-        (session_id, user_id, role, content, attachments_json, actions_json, intent, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        (session_id, user_id, role, content, attachments_json, actions_json, report_json, report_target_json, report_error, report_error_tone, intent, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         RETURNING id
         """,
         (
@@ -481,6 +542,10 @@ def _insert_message(cur, session_id: int, user_id: int, role: str, content: str,
             content,
             _json_dumps(_attachment_meta(attachments)) if attachments else None,
             _json_dumps(actions or []) if actions else None,
+            _json_dumps(report) if isinstance(report, dict) and report else None,
+            _json_dumps(report_target) if isinstance(report_target, dict) and report_target else None,
+            str(report_error or "")[:1000] if report_error else None,
+            str(report_error_tone or "")[:32] if report_error_tone else None,
             intent,
             _now_utc(),
         ),
@@ -891,7 +956,7 @@ def _discover_symbol_candidates_from_search(search_context: dict, existing: list
 def _search_intelligence(message: str, candidates: list[dict], language: str) -> dict:
     query_base = (message or "").strip()
     if not query_base:
-        return {"web_results": [], "news_results": [], "search_queries": []}
+        return {"web_results": [], "news_results": [], "search_queries": [], "provider_status": []}
     entity = ""
     if candidates:
         entity = candidates[0].get("name") or candidates[0].get("symbol") or candidates[0].get("match") or ""
@@ -904,8 +969,10 @@ def _search_intelligence(message: str, candidates: list[dict], language: str) ->
         queries.append("SpaceX valuation public stock ticker latest")
 
     web_results: list[dict] = []
+    provider_status: list[dict] = []
     try:
         service = get_search_service()
+        provider_status = service.provider_status() if hasattr(service, "provider_status") else []
         for q in queries[:3]:
             for item in service.search(q, num_results=5, days=14):
                 web_results.append({
@@ -923,6 +990,7 @@ def _search_intelligence(message: str, candidates: list[dict], language: str) ->
         "web_results": web_results[:8],
         "news_results": web_results[:5],
         "search_queries": queries,
+        "provider_status": provider_status,
         "language": language,
     }
 
@@ -1254,7 +1322,7 @@ def _macro_setup_guidance(indicator: str, provider_status: dict) -> list[dict]:
         },
         {
             "target": "Other search providers",
-            "settings": ["SEARCH_GOOGLE_API_KEY + SEARCH_GOOGLE_CX", "SEARCH_BING_API_KEY", "TAVILY_API_KEYS"],
+            "settings": ["SEARCH_SEARXNG_BASE_URL", "SEARCH_GOOGLE_API_KEY + SEARCH_GOOGLE_CX", "SEARCH_BING_API_KEY", "TAVILY_API_KEYS"],
             "reason": "Lets Copilot verify newly released macro figures when the calendar provider is missing them.",
         },
     ]
@@ -1391,7 +1459,8 @@ def _build_research_context(context: dict, has_image: bool = False) -> dict:
     if not candidates and search_context.get("web_results"):
         candidates.extend(_discover_symbol_candidates_from_search(search_context, candidates))
     primary = candidates[0] if candidates else None
-    macro_context = _macro_intelligence(message) if flags["needs_macro"] else {}
+    raw_macro_context = _macro_intelligence(message) if flags["needs_macro"] else {}
+    macro_context = raw_macro_context if isinstance(raw_macro_context, dict) else {}
 
     selected_snapshot = context.get("market_snapshot")
     primary_snapshot = None
@@ -1407,8 +1476,11 @@ def _build_research_context(context: dict, has_image: bool = False) -> dict:
         data_gaps.append("No usable quote/K-line snapshot was available for the inferred entity. Resolve the symbol or configure the relevant data source.")
     if flags["needs_news"] and not search_context.get("web_results"):
         data_gaps.append("No web/news search result was available. Check search engine configuration or network access.")
-    macro_lookup = macro_context.get("release_lookup") if isinstance(macro_context, dict) else {}
-    if flags["needs_macro"] and not (macro_lookup.get("answerable") or macro_context.get("events")):
+    macro_lookup = macro_context.get("release_lookup") or {}
+    if not isinstance(macro_lookup, dict):
+        macro_lookup = {}
+    macro_events = macro_context.get("events") or []
+    if flags["needs_macro"] and not (macro_lookup.get("answerable") or macro_events):
         data_gaps.append("No exact macro release value was available for this question. Check BLS/Trading Economics/search configuration.")
     if primary and primary.get("market") in {"private_company", "private_business_unit"}:
         data_gaps.append("The inferred entity is not directly exchange-traded; do not answer with a fake public stock price.")
@@ -1418,7 +1490,7 @@ def _build_research_context(context: dict, has_image: bool = False) -> dict:
         recommended_actions.append({"type": "answer", "label": "Use market snapshot for technical levels and risk plan."})
     if search_context.get("web_results"):
         recommended_actions.append({"type": "answer", "label": "Use recent search/news evidence and cite title/source briefly."})
-    if macro_context.get("events"):
+    if macro_events:
         recommended_actions.append({"type": "answer", "label": "Use macro event context and distinguish released values from upcoming events."})
     if primary and not primary.get("symbol"):
         recommended_actions.append({"type": "workflow", "label": "Explain non-tradable/private status and suggest related tradable proxies or search actions."})
@@ -1482,17 +1554,133 @@ def _legacy_intelligence_context(research_context: dict) -> dict:
     }
 
 
-def _enrich_context(context: dict) -> dict:
+def _enrich_context(context: dict, has_image: bool = False) -> dict:
     enriched = dict(context or {})
     if "market_snapshot" not in enriched:
         snapshot = _build_market_snapshot(enriched)
         if snapshot:
             enriched["market_snapshot"] = snapshot
-    research = _build_research_context(enriched)
+    research = _build_research_context(enriched, has_image=has_image)
     if research:
         enriched["research_context"] = research
         enriched["intelligence_context"] = _legacy_intelligence_context(research)
     return enriched
+
+
+def _compact_memory_text(value: Any, limit: int = 900) -> str:
+    text = re.sub(r"\s+", " ", _plain_text(value)).strip()
+    if len(text) > limit:
+        return text[:limit].rstrip() + "..."
+    return text
+
+
+def _first_match(patterns: list[str], text: str) -> str:
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return (match.group(1) if match.groups() else match.group(0)).strip()
+    return ""
+
+
+def _extract_session_known_fields(text: str, context: dict) -> dict:
+    known: dict[str, Any] = {}
+    market = context.get("market")
+    symbol = context.get("symbol")
+    if market or symbol:
+        known["selected_target"] = {"market": market, "symbol": symbol}
+
+    interval = _first_match(
+        [
+            r"\b(\d+\s*(?:m|min|minute|minutes|h|hour|hours|d|day|days|w|week|weeks))\b",
+            r"\b(\d+[mhdw])\b",
+            r"\b(daily|weekly|hourly|1h|4h|15m|30m)\b",
+            r"(每(?:天|日|周|小时)|\d+\s*(?:分钟|小时|天|日|周)|15分钟|30分钟|1小时|4小时|日线|周线)",
+        ],
+        text,
+    )
+    if interval:
+        known["interval_or_timeframe"] = interval
+
+    channels: list[str] = []
+    channel_patterns = {
+        "in_app": r"(站内|站内消息|应用内|in[- ]?app|browser notification)",
+        "email": r"(邮箱|邮件|email|e-mail)",
+        "webhook": r"(webhook|回调)",
+        "sms": r"(短信|sms)",
+        "telegram": r"(telegram|tg)",
+    }
+    for channel, pattern in channel_patterns.items():
+        if re.search(pattern, text, re.IGNORECASE):
+            channels.append(channel)
+    if channels:
+        known["notification_channels"] = channels
+
+    focus = _first_match(
+        [
+            r"(?:重点关注|关注条件|提醒条件|触发条件|监控条件|focus(?: on)?|watch(?: for)?|conditions?)[:：]?\s*([^。；;\n]{4,260})",
+            r"(突破[^。；;\n]{2,180})",
+            r"(跌破[^。；;\n]{2,180})",
+        ],
+        text,
+    )
+    if focus:
+        known["focus_conditions"] = focus
+
+    if re.search(r"(止损|stop loss|sl\b)", text, re.IGNORECASE):
+        known["mentions_stop_loss"] = True
+    if re.search(r"(止盈|take profit|tp\b)", text, re.IGNORECASE):
+        known["mentions_take_profit"] = True
+    if re.search(r"(策略|strategy|脚本|script|指标|indicator)", text, re.IGNORECASE):
+        known["strategy_related"] = True
+    if re.search(r"(新闻|事件|news|event|macro|宏观|经济数据)", text, re.IGNORECASE):
+        known["research_related"] = True
+    return known
+
+
+def _build_session_working_memory(history: list[dict], current_message: str, context: dict, language: str) -> dict:
+    user_facts: list[str] = []
+    assistant_prompts: list[str] = []
+    for item in history[-16:]:
+        role = "assistant" if item.get("role") == "assistant" else "user"
+        content = _compact_memory_text(item.get("content"), 900)
+        if not content:
+            continue
+        if role == "user":
+            user_facts.append(content)
+        elif (
+            "?" in content
+            or "？" in content
+            or re.search(r"(please provide|missing|need|补充|缺少|请选择|请填写|需要)", content, re.IGNORECASE)
+        ):
+            assistant_prompts.append(content)
+
+    current = _compact_memory_text(current_message, 1200)
+    if current:
+        user_facts.append(current)
+
+    combined = "\n".join(user_facts[-10:])
+    known = _extract_session_known_fields(combined, context)
+    agent_task = context.get("agent_task")
+    if isinstance(agent_task, dict) and agent_task:
+        known["active_agent_task"] = {
+            "type": agent_task.get("type") or agent_task.get("id"),
+            "title": agent_task.get("title") or agent_task.get("label"),
+            "required_fields": agent_task.get("required_fields") or agent_task.get("missing_fields"),
+        }
+
+    memory = {
+        "purpose": "session_task_state",
+        "language": language,
+        "known_fields": known,
+        "recent_user_facts": user_facts[-8:],
+        "recent_assistant_questions": assistant_prompts[-3:],
+        "instruction": (
+            "Use this as working memory for the current chat session. "
+            "Do not ask again for fields already present in known_fields or recent_user_facts. "
+            "When enough information has been provided, proceed to the next workflow step instead of restarting the checklist."
+        ),
+    }
+    return memory
 
 
 def _build_system_prompt(language: str, context: dict, intent: str, has_image: bool, json_response: bool = True) -> str:
@@ -1516,11 +1704,20 @@ def _build_system_prompt(language: str, context: dict, intent: str, has_image: b
         "For strategy work, first clarify missing requirements, then propose design, then generate runnable code only when the user confirms or asks to generate. "
         "If the user asks for market/chart diagnosis, separate observable facts from inference. "
         "If market_snapshot is provided, use its actual numbers and avoid generic textbook checklists. "
+        "Treat recent conversation history as active memory. Do not ask again for details already provided in the same session. "
+        "Keep answers decision-first and compact: conclusion first, then evidence, then levels/plan/data gaps. Avoid long generic frameworks unless the user asks for a full report. "
+        "Default to high-signal output: simple questions should be answered in no more than 220 Chinese characters or 120 English words; market diagnosis should use at most five bullets unless the user requests a full report. "
+        "Avoid filler such as generic risk education, repeated disclaimers, long checklists, and process narration. Every useful answer should include a verdict, the key evidence, invalidation or next step, and only the missing data that truly blocks action. "
+        "When information is missing, ask for at most two missing fields at a time and never re-ask for fields already present in the session memory. "
         "If research_context is provided, treat it as the structured research workspace. First resolve the entity, then choose skills, then use market snapshot, search/news, macro events, fundamentals context, and data gaps before answering. "
         "If intelligence_context is provided, treat it as a legacy compatibility summary of research_context. "
         "For macro/current-data questions, inspect provided system context, market_snapshot, economic_calendar_context, tools and skills before saying data is unavailable. "
         "If the exact value is missing, explain the missing field and the needed data-source configuration, then provide the best actionable fallback. "
         "For market analysis, start with a concrete directional read, then provide support/resistance levels, confirmation signals, invalidation, and risk controls. "
+        "For scheduled analysis or monitor setup, first ask for missing interval, notification channels, and focus conditions. "
+        "If symbol, interval, notification preference, and focus conditions are already clear, include an action with type=create_monitor_task and payload "
+        "{\"target\":{\"market\":\"...\",\"symbol\":\"...\"},\"interval_min\":60,\"notify_channels\":[\"browser\"],\"focus_conditions\":\"...\",\"name\":\"...\"}. "
+        "Never create tasks silently; the UI will ask the user to confirm the returned action. "
         "If funding/open interest or other data is unavailable, say unavailable and do not invent it. "
         "If evidence is insufficient, still provide a conditional plan using available data and list what is missing.\n"
     )
@@ -1530,6 +1727,16 @@ def _build_system_prompt(language: str, context: dict, intent: str, has_image: b
         base += (
             f"\n[QuantDinger agent task]\n{_json_dumps(context.get('agent_task'))}\n"
             "Treat this as a workflow state, not a casual chat. Keep the next action explicit.\n"
+        )
+    session_memory = context.get("session_working_memory")
+    if isinstance(session_memory, dict) and session_memory:
+        base += (
+            "\n[Session working memory]\n"
+            + _json_dumps(session_memory)[:9000]
+            + "\n"
+            "This memory is authoritative for the current session. Merge new user answers into this task state. "
+            "If the user has already supplied a requested field, acknowledge it briefly and ask only for the next missing field. "
+            "If no required fields are missing, produce the result or action now.\n"
         )
     research_context = context.get("research_context")
     if isinstance(research_context, dict) and research_context:
@@ -1555,10 +1762,10 @@ def _build_system_prompt(language: str, context: dict, intent: str, has_image: b
         base += "\n[Economic calendar context]\n" + _json_dumps(calendar_context[:30])[:5000] + "\n"
     if not json_response:
         return base + (
-            "Respond in clean Markdown. Prefer concise but deep analysis over broad frameworks. "
-            "Use this structure when the user asks for a symbol analysis: "
-            "1) Current read, 2) Key levels, 3) Volume/participation, 4) Funding/capital flow status, 5) Trading plan with bull/base/bear scenarios, 6) Risks. "
-            "Each scenario must include trigger, invalidation, and what to watch next. "
+            "Respond in clean Markdown. Prefer concise, evidence-dense analysis over broad frameworks. "
+            "For symbol analysis, use at most three short sections by default: verdict, key evidence/levels, and action plan. "
+            "Only expand into a full six-part report when the user asks for a report or deep analysis. "
+            "If scenarios are useful, keep them to bull/base/bear with trigger, invalidation, and what to watch next. "
             "Use headings, bullet lists, tables when useful, and fenced code blocks for code. "
             "Do not wrap the full response in JSON."
         )
@@ -1566,7 +1773,7 @@ def _build_system_prompt(language: str, context: dict, intent: str, has_image: b
         base +
         "Return JSON only with this schema: "
         "{\"answer\":\"markdown answer\", \"summary\":\"short title\", \"confidence\":0-100, "
-        "\"actions\":[{\"type\":\"analysis|strategy|debug|risk|todo\", \"label\":\"...\", \"payload\":{}}], "
+        "\"actions\":[{\"type\":\"analysis|strategy|debug|risk|todo|create_monitor_task\", \"label\":\"...\", \"payload\":{}}], "
         "\"artifact\":{\"type\":\"none|strategy_code|checklist|market_note\", \"title\":\"...\", \"content\":\"...\"}}."
     )
 
@@ -1574,12 +1781,23 @@ def _build_system_prompt(language: str, context: dict, intent: str, has_image: b
 def _build_llm_messages(history: list[dict], message: str, attachments: list[dict], context: dict, language: str, intent: str, json_response: bool = True) -> list[dict]:
     context = dict(context or {})
     context["user_message"] = message or ""
+    context["session_working_memory"] = _build_session_working_memory(history, message or "", context, language)
     messages: list[dict] = [
         {"role": "system", "content": _build_system_prompt(language, context, intent, bool(attachments), json_response=json_response)}
     ]
-    for h in history[-8:]:
+    for h in history[-12:]:
         role = "assistant" if h.get("role") == "assistant" else "user"
-        messages.append({"role": role, "content": str(h.get("content") or "")[:4000]})
+        content = str(h.get("content") or "")[:4000]
+        hist_attachments = _json_loads(h.get("attachments_json"), [])
+        if isinstance(hist_attachments, list) and hist_attachments:
+            names = ", ".join(
+                str(att.get("name") or "image")[:80]
+                for att in hist_attachments
+                if isinstance(att, dict)
+            )
+            if names:
+                content += f"\n[Historical attachment(s): {names}. Image bytes are stored for UI history; ask the user to reattach if visual detail is needed again.]"
+        messages.append({"role": role, "content": content})
 
     context_note = ""
     if context:
@@ -1653,6 +1871,30 @@ def _build_preflight(user_id: int) -> dict:
             "ready": True,
             "action": {"path": "/settings", "query": {"section": "data-source"}},
         },
+        "search": {
+            "ready": False,
+            "providers": [],
+            "action": {"path": "/settings", "query": {"section": "ai-llm"}},
+        },
+        "macro_sources": {
+            "calendar": [
+                {
+                    "provider": "TradingEconomics",
+                    "configured": TradingEconomicsConfig.CONFIGURED,
+                    "available": TradingEconomicsConfig.CONFIGURED,
+                    "purpose": "Structured global macro calendar with actual/forecast/previous fields.",
+                },
+                {
+                    "provider": "AkShare",
+                    "configured": True,
+                    "available": True,
+                    "timeout": AkshareConfig.TIMEOUT,
+                    "purpose": "Free fallback for selected China/US macro data and calendar feeds.",
+                },
+            ],
+            "series": [],
+            "action": {"path": "/settings", "query": {"section": "data-source"}},
+        },
         "broker": {
             "ready": False,
             "count": 0,
@@ -1661,6 +1903,18 @@ def _build_preflight(user_id: int) -> dict:
         "blockers": [],
         "warnings": [],
     }
+    try:
+        search_service = get_search_service()
+        providers = search_service.provider_status() if hasattr(search_service, "provider_status") else []
+        result["search"]["providers"] = providers
+        result["search"]["ready"] = any(bool(p.get("registered") and p.get("available")) for p in providers)
+    except Exception as e:
+        result["warnings"].append({"key": "search_check_failed", "message": str(e)})
+    try:
+        macro_provider = get_macro_series_provider()
+        result["macro_sources"]["series"] = macro_provider.source_status()
+    except Exception as e:
+        result["warnings"].append({"key": "macro_source_check_failed", "message": str(e)})
     try:
         with get_db_connection() as db:
             cur = db.cursor()
@@ -1917,7 +2171,7 @@ def chat_message():
     context["intent"] = intent
     context["agent_intent"] = agent_plan
     context["language"] = language
-    context = _enrich_context(context)
+    context = _enrich_context(context, has_image=bool(attachments))
 
     try:
         with get_db_connection() as db:
@@ -1941,7 +2195,7 @@ def chat_message():
                 }), 402
 
             context["user_memories"] = _get_user_memories(cur, user_id)
-            history = _load_recent_messages(cur, sid, limit=10)
+            history = _load_recent_messages(cur, sid, limit=20)
             llm_messages = _build_llm_messages(history[:-1], message or "Please analyze the attached chart image.", attachments, context, language, intent)
             raw = LLMService().call_llm_api(llm_messages, temperature=0.35, use_json_mode=True)
             parsed = _parse_llm_json(raw)
@@ -2006,7 +2260,7 @@ def chat_message_stream():
     context["intent"] = intent
     context["agent_intent"] = agent_plan
     context["language"] = language
-    context = _enrich_context(context)
+    context = _enrich_context(context, has_image=bool(attachments))
 
     @stream_with_context
     def generate():
@@ -2032,7 +2286,7 @@ def chat_message_stream():
                     return
 
                 context["user_memories"] = _get_user_memories(cur, user_id)
-                history = _load_recent_messages(cur, sid, limit=10)
+                history = _load_recent_messages(cur, sid, limit=20)
                 llm_messages = _build_llm_messages(
                     history[:-1],
                     message or "Please analyze the attached chart image.",
@@ -2136,7 +2390,9 @@ def get_chat_history():
                 return jsonify({"code": 0, "msg": "session_not_found", "data": None}), 404
             cur.execute(
                 """
-                SELECT id, role, content, attachments_json, actions_json, intent, created_at
+                SELECT id, role, content, attachments_json, actions_json,
+                       report_json, report_target_json, report_error, report_error_tone,
+                       intent, created_at
                 FROM qd_ai_copilot_messages
                 WHERE session_id = ? AND user_id = ?
                 ORDER BY id ASC
@@ -2146,16 +2402,20 @@ def get_chat_history():
             messages = []
             for row in cur.fetchall() or []:
                 item = _row_to_dict(row)
-                try:
-                    item["attachments"] = json.loads(item.get("attachments_json") or "[]")
-                except Exception:
-                    item["attachments"] = []
-                try:
-                    item["actions"] = json.loads(item.get("actions_json") or "[]")
-                except Exception:
-                    item["actions"] = []
-                item.pop("attachments_json", None)
-                item.pop("actions_json", None)
+                item["attachments"] = _json_loads(item.get("attachments_json"), [])
+                item["actions"] = _json_loads(item.get("actions_json"), [])
+                report = _json_loads(item.get("report_json"), None)
+                report_target = _json_loads(item.get("report_target_json"), None)
+                if isinstance(report, dict):
+                    item["report"] = report
+                if isinstance(report_target, dict):
+                    item["reportTarget"] = report_target
+                if item.get("report_error"):
+                    item["reportError"] = item.get("report_error")
+                if item.get("report_error_tone"):
+                    item["reportErrorTone"] = item.get("report_error_tone")
+                for key in ("attachments_json", "actions_json", "report_json", "report_target_json", "report_error", "report_error_tone"):
+                    item.pop(key, None)
                 messages.append(item)
             cur.close()
         return jsonify({"code": 1, "msg": "success", "data": {"session": session, "messages": messages}})
@@ -2173,12 +2433,21 @@ def save_local_chat_message():
     role = str(data.get("role") or "assistant").strip().lower()
     if role not in ("user", "assistant"):
         role = "assistant"
+    report = data.get("report") if isinstance(data.get("report"), dict) else None
+    report_target = data.get("reportTarget") if isinstance(data.get("reportTarget"), dict) else None
+    report_error = str(data.get("reportError") or "").strip()[:1000]
+    report_error_tone = str(data.get("reportErrorTone") or "").strip()[:32]
     content = str(data.get("content") or "").strip()
+    if not content and report:
+        symbol = report.get("symbol") or (report_target or {}).get("symbol") or "report"
+        market = report.get("market") or (report_target or {}).get("market") or ""
+        content = f"Analysis report: {market}:{symbol}".strip(":")
+    if not content and report_error:
+        content = f"Analysis failed: {report_error}"
     if not content:
         return jsonify({"code": 0, "msg": "Missing message content", "data": None}), 400
 
     context = data.get("context") if isinstance(data.get("context"), dict) else {}
-    context = _enrich_context(context)
     intent = str(data.get("intent") or data.get("meta") or "local_agent").strip()[:64]
     session_id = data.get("session_id") or data.get("chatId")
     message_id = data.get("message_id")
@@ -2188,6 +2457,7 @@ def save_local_chat_message():
         attachments = _normalize_attachments(data.get("attachments") or [])
     except ValueError as e:
         return jsonify({"code": 0, "msg": str(e), "data": None}), 400
+    context = _enrich_context(context, has_image=bool(attachments))
 
     try:
         with get_db_connection() as db:
@@ -2205,10 +2475,23 @@ def save_local_chat_message():
                     cur.execute(
                         """
                         UPDATE qd_ai_copilot_messages
-                        SET role = ?, content = ?, attachments_json = ?, actions_json = ?, intent = ?
+                        SET role = ?, content = ?, attachments_json = ?, actions_json = ?,
+                            report_json = ?, report_target_json = ?, report_error = ?, report_error_tone = ?, intent = ?
                         WHERE id = ? AND user_id = ?
                         """,
-                        (role, content, _json_dumps(attachments), _json_dumps(actions), intent, int(message_id), user_id),
+                        (
+                            role,
+                            content,
+                            _json_dumps(attachments),
+                            _json_dumps(actions),
+                            _json_dumps(report) if report else None,
+                            _json_dumps(report_target) if report_target else None,
+                            report_error or None,
+                            report_error_tone or None,
+                            intent,
+                            int(message_id),
+                            user_id,
+                        ),
                     )
                     cur.execute("UPDATE qd_ai_copilot_sessions SET updated_at = NOW() WHERE id = ?", (sid,))
                     db.commit()
@@ -2220,7 +2503,20 @@ def save_local_chat_message():
                 sid = int(session["id"])
             else:
                 sid = _create_session(cur, user_id, _title_from_message(content), context)
-            mid = _insert_message(cur, sid, user_id, role, content, attachments, intent, actions=actions)
+            mid = _insert_message(
+                cur,
+                sid,
+                user_id,
+                role,
+                content,
+                attachments,
+                intent,
+                actions=actions,
+                report=report,
+                report_target=report_target,
+                report_error=report_error,
+                report_error_tone=report_error_tone,
+            )
             cur.execute("UPDATE qd_ai_copilot_sessions SET updated_at = NOW() WHERE id = ?", (sid,))
             db.commit()
             cur.close()
@@ -2228,6 +2524,281 @@ def save_local_chat_message():
     except Exception as e:
         logger.error(f"save_local_chat_message failed: {e}", exc_info=True)
         return jsonify({"code": 0, "msg": str(e), "data": None}), 500
+
+
+def _has_cjk_text(value: Any) -> bool:
+    text = _plain_text(value)
+    return bool(re.search(r"[\u2e80-\u9fff\uac00-\ud7af\u3040-\u30ff]", text))
+
+
+def _register_report_pdf_font(prefer_cjk: bool = False) -> str:
+    from pathlib import Path
+
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+
+    candidates = [
+        ("C:/Windows/Fonts/msyh.ttc", True),
+        ("C:/Windows/Fonts/msyh.ttf", True),
+        ("C:/Windows/Fonts/simsun.ttc", True),
+        ("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", True),
+        ("/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc", True),
+        ("/usr/share/fonts/truetype/wqy/wqy-microhei.ttc", True),
+        ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", False),
+    ]
+    for path, is_cjk in candidates:
+        if prefer_cjk and not is_cjk:
+            continue
+        try:
+            if Path(path).exists():
+                pdfmetrics.registerFont(TTFont("QuantDingerSans", path))
+                return "QuantDingerSans"
+        except Exception as e:
+            logger.debug(f"Failed to register PDF font {path}: {e}")
+    if prefer_cjk:
+        try:
+            from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+
+            pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))
+            return "STSong-Light"
+        except Exception as e:
+            logger.debug(f"Failed to register built-in CJK PDF font: {e}")
+    return "Helvetica"
+
+
+def _build_ai_report_pdf(report: dict, target: dict | None = None, language: str = "en-US") -> bytes:
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.units import mm
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfgen import canvas
+
+    target = target or {}
+    zh = str(language or "").lower().startswith("zh")
+    prefer_cjk = zh or _has_cjk_text(report) or _has_cjk_text(target)
+    font_name = _register_report_pdf_font(prefer_cjk=prefer_cjk)
+    title_font = font_name
+    width, height = A4
+    margin = 18 * mm
+    y = height - margin
+    line_gap = 4
+    page_no = 1
+    buf = BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+
+    labels = {
+        "title": "QuantDinger AI Analysis Report" if not zh else "QuantDinger AI 分析报告",
+        "target": "Target" if not zh else "标的",
+        "generated": "Generated" if not zh else "生成时间",
+        "summary": "Summary" if not zh else "摘要",
+        "plan": "Trading Plan" if not zh else "交易计划",
+        "scores": "Scores" if not zh else "评分",
+        "trend": "Trend Outlook" if not zh else "周期趋势预测",
+        "crypto": "Crypto Market Structure" if not zh else "加密市场结构",
+        "details": "Detailed Analysis" if not zh else "详细分析",
+        "reasons": "Key Reasons" if not zh else "核心理由",
+        "risks": "Risks" if not zh else "风险提示",
+        "indicators": "Indicators" if not zh else "技术指标",
+    }
+
+    def fit_text(text: Any, max_width: float, font_size: int = 10) -> list[str]:
+        raw = _plain_text(text).replace("\r\n", "\n").replace("\r", "\n")
+        lines: list[str] = []
+        for paragraph in raw.split("\n"):
+            if not paragraph:
+                lines.append("")
+                continue
+            current = ""
+            tokens = paragraph.split(" ")
+            if len(tokens) == 1:
+                tokens = list(paragraph)
+                joiner = ""
+            else:
+                joiner = " "
+            for token in tokens:
+                candidate = token if not current else current + joiner + token
+                if pdfmetrics.stringWidth(candidate, font_name, font_size) <= max_width:
+                    current = candidate
+                else:
+                    if current:
+                        lines.append(current)
+                    current = token
+            if current:
+                lines.append(current)
+        return lines
+
+    def footer() -> None:
+        c.setFont(font_name, 8)
+        c.setFillColor(colors.HexColor("#8a94a6"))
+        c.drawRightString(width - margin, 12 * mm, f"QuantDinger · {page_no}")
+
+    def ensure(space: float) -> None:
+        nonlocal y, page_no
+        if y - space >= margin:
+            return
+        footer()
+        c.showPage()
+        page_no += 1
+        y = height - margin
+
+    def draw_text(text: Any, font_size: int = 10, color: str = "#1f2937", bold: bool = False, indent: float = 0) -> None:
+        nonlocal y
+        c.setFillColor(colors.HexColor(color))
+        c.setFont(title_font if bold else font_name, font_size)
+        max_width = width - margin * 2 - indent
+        lines = fit_text(text, max_width, font_size)
+        for line in lines:
+            ensure(font_size + line_gap)
+            c.drawString(margin + indent, y, line)
+            y -= font_size + line_gap
+
+    def draw_section(title: str) -> None:
+        nonlocal y
+        ensure(24)
+        y -= 5
+        c.setStrokeColor(colors.HexColor("#d9e2f2"))
+        c.line(margin, y, width - margin, y)
+        y -= 17
+        draw_text(title, 13, "#0f172a", True)
+
+    def draw_pairs(items: list[tuple[str, Any]]) -> None:
+        nonlocal y
+        for i in range(0, len(items), 2):
+            ensure(20)
+            row = items[i:i + 2]
+            for col, (name, value) in enumerate(row):
+                x = margin + col * ((width - margin * 2) / 2)
+                c.setFont(font_name, 8)
+                c.setFillColor(colors.HexColor("#7b8797"))
+                c.drawString(x, y, _plain_text(name))
+                c.setFont(font_name, 10)
+                c.setFillColor(colors.HexColor("#111827"))
+                c.drawString(x + 32 * mm, y, _plain_text(value)[:48])
+            y -= 15
+
+    def add_list(items: Any) -> None:
+        if not isinstance(items, list):
+            return
+        for item in items:
+            draw_text(f"• {_plain_text(item)}", 10, "#374151", False, 3 * mm)
+
+    symbol = report.get("symbol") or target.get("symbol") or ""
+    market = report.get("market") or target.get("market") or ""
+    c.setTitle(labels["title"])
+    c.setFont(title_font, 20)
+    c.setFillColor(colors.HexColor("#0f172a"))
+    c.drawString(margin, y, labels["title"])
+    y -= 20
+    draw_pairs([
+        (labels["target"], f"{market}:{symbol}" if market or symbol else "-"),
+        (labels["generated"], _now_utc().strftime("%Y-%m-%d %H:%M UTC")),
+    ])
+
+    decision = _plain_text(report.get("decision") or "HOLD").upper()
+    decision_color = "#16a34a" if decision == "BUY" else "#dc2626" if decision == "SELL" else "#d97706"
+    ensure(36)
+    c.setFillColor(colors.HexColor(decision_color))
+    c.roundRect(margin, y - 24, 42 * mm, 22, 5, fill=1, stroke=0)
+    c.setFillColor(colors.white)
+    c.setFont(title_font, 13)
+    c.drawCentredString(margin + 21 * mm, y - 17, decision)
+    c.setFillColor(colors.HexColor("#111827"))
+    c.setFont(font_name, 10)
+    c.drawString(margin + 48 * mm, y - 10, f"Confidence: {report.get('confidence', '-')}")
+    y -= 34
+
+    if report.get("summary"):
+        draw_section(labels["summary"])
+        draw_text(report.get("summary"), 10)
+
+    market_data = report.get("market_data") if isinstance(report.get("market_data"), dict) else {}
+    plan = report.get("trading_plan") if isinstance(report.get("trading_plan"), dict) else {}
+    plan_items = [
+        ("Current Price", market_data.get("current_price")),
+        ("24h Change", market_data.get("change_24h")),
+        ("Entry", plan.get("entry_price") or plan.get("entryPrice")),
+        ("Stop Loss", plan.get("stop_loss") or plan.get("stopLoss")),
+        ("Take Profit", plan.get("take_profit") or plan.get("takeProfit")),
+        ("Risk/Reward", plan.get("risk_reward_ratio") or plan.get("riskRewardRatio")),
+    ]
+    if any(v not in (None, "") for _, v in plan_items):
+        draw_section(labels["plan"])
+        draw_pairs([(k, "-" if v in (None, "") else v) for k, v in plan_items])
+
+    scores = report.get("scores") if isinstance(report.get("scores"), dict) else {}
+    if scores:
+        draw_section(labels["scores"])
+        draw_pairs([(str(k).replace("_", " ").title(), v) for k, v in scores.items()])
+
+    trend = report.get("trend_outlook") or report.get("trendOutlook")
+    trend_summary = report.get("trend_outlook_summary") or report.get("trendOutlookSummary")
+    if trend_summary or trend:
+        draw_section(labels["trend"])
+        if trend_summary:
+            draw_text(trend_summary, 10)
+        if isinstance(trend, dict):
+            draw_pairs([(str(k), _plain_text(v)) for k, v in trend.items()])
+
+    crypto_summary = report.get("crypto_factor_summary")
+    crypto_factors = report.get("crypto_factors") if isinstance(report.get("crypto_factors"), dict) else {}
+    if crypto_summary or crypto_factors:
+        draw_section(labels["crypto"])
+        if crypto_summary:
+            draw_text(crypto_summary, 10)
+        if crypto_factors:
+            draw_pairs([(str(k).replace("_", " "), _plain_text(v)) for k, v in crypto_factors.items() if k != "signals"])
+
+    details = report.get("detailed_analysis") if isinstance(report.get("detailed_analysis"), dict) else {}
+    if details:
+        draw_section(labels["details"])
+        for key, value in details.items():
+            draw_text(str(key).replace("_", " ").title(), 11, "#0f172a", True)
+            draw_text(value, 10)
+
+    if report.get("reasons"):
+        draw_section(labels["reasons"])
+        add_list(report.get("reasons"))
+    if report.get("risks"):
+        draw_section(labels["risks"])
+        add_list(report.get("risks"))
+
+    indicators = report.get("indicators") if isinstance(report.get("indicators"), dict) else {}
+    if indicators:
+        draw_section(labels["indicators"])
+        draw_pairs([(str(k).replace("_", " "), _plain_text(v)) for k, v in indicators.items()])
+
+    footer()
+    c.save()
+    return buf.getvalue()
+
+
+@ai_chat_blp.route("/chat/report/pdf", methods=["POST"])
+@login_required
+def export_chat_report_pdf():
+    data = request.get_json(silent=True) or {}
+    report = data.get("report") if isinstance(data.get("report"), dict) else None
+    if not report:
+        return jsonify({"code": 0, "msg": "Missing report data", "data": None}), 400
+    target = data.get("target") if isinstance(data.get("target"), dict) else {}
+    language = str(data.get("language") or request.headers.get("X-App-Lang") or "en-US")
+    try:
+        pdf_bytes = _build_ai_report_pdf(report, target, language)
+    except ImportError:
+        return jsonify({"code": 0, "msg": "PDF export dependency missing: install reportlab", "data": None}), 500
+    except Exception as e:
+        logger.error(f"export_chat_report_pdf failed: {e}", exc_info=True)
+        return jsonify({"code": 0, "msg": str(e), "data": None}), 500
+
+    symbol = re.sub(r"[^A-Za-z0-9._-]+", "_", _plain_text(report.get("symbol") or target.get("symbol") or "report")).strip("_")
+    filename = f"QuantDinger_{symbol or 'report'}_{_now_utc().strftime('%Y%m%d')}.pdf"
+    return Response(
+        pdf_bytes,
+        mimetype="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Length": str(len(pdf_bytes)),
+        },
+    )
 
 
 @ai_chat_blp.route("/chat/history/save", methods=["POST"])

@@ -61,6 +61,31 @@ need_command() {
     command -v "$1" >/dev/null 2>&1 || fail "$1 is required but was not found"
 }
 
+read_from_terminal() {
+    # curl ... | bash gives the script body on stdin. Keep prompts interactive by
+    # reading answers from the controlling terminal whenever one is available.
+    if [ -r /dev/tty ]; then
+        IFS= read -r value < /dev/tty || value=""
+    else
+        IFS= read -r value || value=""
+    fi
+    printf '%s' "$value"
+}
+
+read_secret_from_terminal() {
+    if [ -r /dev/tty ]; then
+        stty -echo < /dev/tty 2>/dev/null || true
+        IFS= read -r value < /dev/tty || value=""
+        stty echo < /dev/tty 2>/dev/null || true
+    else
+        stty -echo 2>/dev/null || true
+        IFS= read -r value || value=""
+        stty echo 2>/dev/null || true
+    fi
+    printf '\n' >&2
+    printf '%s' "$value"
+}
+
 read_line() {
     prompt="$1"
     default_value="${2:-}"
@@ -69,7 +94,7 @@ read_line() {
     else
         printf '%b' "${CYAN}${prompt}: ${NC}" >&2
     fi
-    IFS= read -r value || value=""
+    value="$(read_from_terminal)"
     if [ -z "$value" ]; then
         value="$default_value"
     fi
@@ -79,21 +104,13 @@ read_line() {
 read_secret() {
     prompt="$1"
     printf '%b' "${CYAN}${prompt}: ${NC}" >&2
-    stty -echo 2>/dev/null || true
-    IFS= read -r value || value=""
-    stty echo 2>/dev/null || true
-    printf '\n' >&2
-    printf '%s' "$value"
+    read_secret_from_terminal
 }
 
 read_secret_optional() {
     prompt="$1"
     printf '%b' "${CYAN}${prompt}: ${NC}" >&2
-    stty -echo 2>/dev/null || true
-    IFS= read -r value || value=""
-    stty echo 2>/dev/null || true
-    printf '\n' >&2
-    printf '%s' "$value"
+    read_secret_from_terminal
 }
 
 env_get() {

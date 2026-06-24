@@ -566,6 +566,81 @@ def update_profile():
         return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
 
 
+@user_blp.route('/mfa/status', methods=['GET'])
+@login_required
+def get_mfa_status():
+    """Get current user's authenticator-app MFA status."""
+    try:
+        user_id = getattr(g, 'user_id', None)
+        if not user_id:
+            return jsonify({'code': 0, 'msg': 'Not authenticated', 'data': None}), 401
+        from app.services.mfa_service import get_mfa_service
+        return jsonify({'code': 1, 'msg': 'success', 'data': get_mfa_service().get_status(int(user_id))})
+    except Exception as e:
+        logger.error(f"get_mfa_status failed: {e}")
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
+
+
+@user_blp.route('/mfa/setup/start', methods=['POST'])
+@login_required
+def start_mfa_setup():
+    """Start authenticator-app binding and return QR code data."""
+    try:
+        user_id = getattr(g, 'user_id', None)
+        if not user_id:
+            return jsonify({'code': 0, 'msg': 'Not authenticated', 'data': None}), 401
+        user = get_user_service().get_user_by_id(int(user_id)) or {}
+        label = user.get('email') or user.get('username') or f'user-{user_id}'
+        from app.services.mfa_service import get_mfa_service
+        data = get_mfa_service().start_setup(int(user_id), label)
+        return jsonify({'code': 1, 'msg': 'Scan the QR code with your authenticator app', 'data': data})
+    except ValueError as e:
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 400
+    except Exception as e:
+        logger.error(f"start_mfa_setup failed: {e}")
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
+
+
+@user_blp.route('/mfa/setup/confirm', methods=['POST'])
+@login_required
+def confirm_mfa_setup():
+    """Confirm authenticator-app binding with a 6-digit TOTP code."""
+    try:
+        user_id = getattr(g, 'user_id', None)
+        if not user_id:
+            return jsonify({'code': 0, 'msg': 'Not authenticated', 'data': None}), 401
+        data = request.get_json() or {}
+        code = data.get('code') or ''
+        from app.services.mfa_service import get_mfa_service
+        result = get_mfa_service().confirm_setup(int(user_id), code)
+        return jsonify({'code': 1, 'msg': 'MFA enabled successfully', 'data': result})
+    except ValueError as e:
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 400
+    except Exception as e:
+        logger.error(f"confirm_mfa_setup failed: {e}")
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
+
+
+@user_blp.route('/mfa/disable', methods=['POST'])
+@login_required
+def disable_mfa():
+    """Disable current user's authenticator-app MFA after code verification."""
+    try:
+        user_id = getattr(g, 'user_id', None)
+        if not user_id:
+            return jsonify({'code': 0, 'msg': 'Not authenticated', 'data': None}), 401
+        data = request.get_json() or {}
+        code = data.get('code') or ''
+        from app.services.mfa_service import get_mfa_service
+        get_mfa_service().disable(int(user_id), code)
+        return jsonify({'code': 1, 'msg': 'MFA disabled successfully', 'data': None})
+    except ValueError as e:
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 400
+    except Exception as e:
+        logger.error(f"disable_mfa failed: {e}")
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
+
+
 @user_blp.route('/my-credits-log', methods=['GET'])
 @login_required
 def get_my_credits_log():
