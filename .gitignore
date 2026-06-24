@@ -30,6 +30,13 @@ backend_api_python/.env
 .idea/
 .vscode/
 agent-tools/
+.cache/
+.codex/
+.codex-logs/
+.agents/
+.local_tools/
+outputs/
+.pytest_cache/
 *.swp
 *.swo
 *~

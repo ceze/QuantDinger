@@ -198,6 +198,67 @@ class LLMService:
     def base_url(self):
         return self.get_base_url()
 
+    @staticmethod
+    def _truthy(value: Any) -> bool:
+        return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+    def _llm_proxy_url(self) -> str:
+        config = load_addon_config()
+        return str(
+            config.get("llm", {}).get("proxy_url")
+            or os.getenv("LLM_PROXY_URL", "")
+            or ""
+        ).strip()
+
+    def _llm_use_system_proxy(self) -> bool:
+        config = load_addon_config()
+        value = config.get("llm", {}).get("use_system_proxy")
+        if value is None:
+            value = os.getenv("LLM_USE_SYSTEM_PROXY", "false")
+        return self._truthy(value)
+
+    def _llm_post(self, url: str, *, headers: dict, json_payload: dict, timeout: int, stream: bool = False):
+        """
+        Send LLM HTTP requests without inheriting exchange/data-source proxies.
+
+        PROXY_URL is intentionally global for market data and broker/exchange APIs,
+        but LLM providers should not be routed through it unless explicitly requested.
+        This avoids failures such as host.docker.internal:7890 refusing LLM traffic.
+        """
+        session = requests.Session()
+        proxy_url = self._llm_proxy_url()
+        use_system_proxy = self._llm_use_system_proxy()
+        session.trust_env = use_system_proxy and not proxy_url
+
+        kwargs = {
+            "headers": headers,
+            "json": json_payload,
+            "timeout": timeout,
+            "stream": stream,
+        }
+        if proxy_url:
+            kwargs["proxies"] = {"http": proxy_url, "https": proxy_url}
+
+        try:
+            response = session.post(url, **kwargs)
+        except requests.exceptions.RequestException as exc:
+            session.close()
+            hint = ""
+            msg = str(exc)
+            if "SOCKS" in msg or "Proxy" in msg or "proxy" in msg:
+                hint = (
+                    " LLM request was routed through a proxy. Leave LLM_PROXY_URL empty "
+                    "for direct LLM access, or set it to a reachable proxy and keep "
+                    "LLM_USE_SYSTEM_PROXY disabled unless you really want system proxy env vars."
+                )
+            raise requests.exceptions.ConnectionError(f"{msg}{hint}") from exc
+
+        if stream:
+            response._quantdinger_llm_session = session
+        else:
+            session.close()
+        return response
+
     def _call_openai_compatible(self, messages: list, model: str, temperature: float, 
                                  api_key: str, base_url: str, timeout: int,
                                  use_json_mode: bool = True) -> str:
@@ -226,7 +287,7 @@ class LLMService:
         if use_json_mode and "atlascloud" not in (base_url or "").lower():
             data["response_format"] = {"type": "json_object"}
 
-        response = requests.post(url, headers=headers, json=data, timeout=timeout)
+        response = self._llm_post(url, headers=headers, json_payload=data, timeout=timeout)
         
         # Handle non-2xx with provider/model-aware details
         if response.status_code >= 400:
@@ -317,7 +378,7 @@ class LLMService:
         
         headers = {"Content-Type": "application/json"}
         
-        response = requests.post(url, headers=headers, json=data, timeout=timeout)
+        response = self._llm_post(url, headers=headers, json_payload=data, timeout=timeout)
         response.raise_for_status()
         
         result = response.json()
@@ -387,7 +448,7 @@ class LLMService:
             "temperature": temperature,
             "stream": True,
         }
-        response = requests.post(url, headers=headers, json=data, timeout=timeout, stream=True)
+        response = self._llm_post(url, headers=headers, json_payload=data, timeout=timeout, stream=True)
         if response.status_code >= 400:
             err_text = ""
             try:
@@ -395,30 +456,40 @@ class LLMService:
                 err_text = err.get("message") if isinstance(err, dict) else str(err or "")
             except Exception:
                 err_text = (response.text or "").strip()[:300]
+            session = getattr(response, "_quantdinger_llm_session", None)
+            response.close()
+            if session is not None:
+                session.close()
             raise ValueError(f"LLM API {response.status_code}: {err_text}".strip())
 
-        for raw_line in response.iter_lines(decode_unicode=False):
-            if not raw_line:
-                continue
-            if isinstance(raw_line, bytes):
-                line = raw_line.decode("utf-8", errors="replace").strip()
-            else:
-                line = str(raw_line).strip()
-            if line.startswith("data:"):
-                line = line[5:].strip()
-            if line == "[DONE]":
-                break
-            try:
-                payload = json.loads(line)
-            except Exception:
-                continue
-            choices = payload.get("choices") or []
-            if not choices:
-                continue
-            delta = choices[0].get("delta") or {}
-            content = delta.get("content")
-            if content:
-                yield content
+        try:
+            for raw_line in response.iter_lines(decode_unicode=False):
+                if not raw_line:
+                    continue
+                if isinstance(raw_line, bytes):
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                else:
+                    line = str(raw_line).strip()
+                if line.startswith("data:"):
+                    line = line[5:].strip()
+                if line == "[DONE]":
+                    break
+                try:
+                    payload = json.loads(line)
+                except Exception:
+                    continue
+                choices = payload.get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta") or {}
+                content = delta.get("content")
+                if content:
+                    yield content
+        finally:
+            session = getattr(response, "_quantdinger_llm_session", None)
+            response.close()
+            if session is not None:
+                session.close()
 
     def _normalize_model_for_provider(self, model: str, provider: LLMProvider) -> str:
         """

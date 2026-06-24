@@ -133,6 +133,8 @@ def load_addon_config() -> Dict[str, Any]:
 
         # LLM Provider Selection
         ('LLM_PROVIDER', 'llm.provider', 'string'),
+        ('LLM_PROXY_URL', 'llm.proxy_url', 'string'),
+        ('LLM_USE_SYSTEM_PROXY', 'llm.use_system_proxy', 'bool'),
 
         # App
         ('RATE_LIMIT', 'app.rate_limit', 'int'),
@@ -156,6 +158,17 @@ def load_addon_config() -> Dict[str, Any]:
         ('TRADING_ECONOMICS_BASE_URL', 'tradingeconomics.base_url', 'string'),
         ('TRADING_ECONOMICS_TIMEOUT', 'tradingeconomics.timeout', 'int'),
 
+        # Macro research sources
+        ('FRED_API_KEY', 'fred.api_key', 'string'),
+        ('FRED_BASE_URL', 'fred.base_url', 'string'),
+        ('FRED_TIMEOUT', 'fred.timeout', 'int'),
+        ('BLS_API_KEY', 'bls.api_key', 'string'),
+        ('BLS_BASE_URL', 'bls.base_url', 'string'),
+        ('BLS_TIMEOUT', 'bls.timeout', 'int'),
+        ('BEA_API_KEY', 'bea.api_key', 'string'),
+        ('BEA_BASE_URL', 'bea.base_url', 'string'),
+        ('BEA_TIMEOUT', 'bea.timeout', 'int'),
+
         # Crypto analytics
         ('COINGLASS_API_KEY', 'coinglass.api_key', 'string'),
         ('CRYPTOQUANT_API_KEY', 'cryptoquant.api_key', 'string'),
@@ -177,12 +190,26 @@ def load_addon_config() -> Dict[str, Any]:
         ('SEARCH_GOOGLE_API_KEY', 'search.google.api_key', 'string'),
         ('SEARCH_GOOGLE_CX', 'search.google.cx', 'string'),
         ('SEARCH_BING_API_KEY', 'search.bing.api_key', 'string'),
+        ('SEARCH_SEARXNG_BASE_URL', 'search.searxng.base_url', 'string'),
+        ('SEARCH_SEARXNG_ENGINES', 'search.searxng.engines', 'string'),
+        ('SEARCH_SEARXNG_CATEGORIES', 'search.searxng.categories', 'string'),
+        ('SEARCH_SEARXNG_LANGUAGE', 'search.searxng.language', 'string'),
+        ('SEARCH_SEARXNG_TIMEOUT', 'search.searxng.timeout', 'int'),
         
         # Tavily (AI-optimized search)
         ('TAVILY_API_KEYS', 'tavily.api_keys', 'string'),
         
         # SerpAPI (Google/Bing scraper)
         ('SERPAPI_KEYS', 'serpapi.api_keys', 'string'),
+
+        # Free/global news and company news/sentiment
+        ('GDELT_BASE_URL', 'gdelt.base_url', 'string'),
+        ('GDELT_TIMEOUT', 'gdelt.timeout', 'int'),
+        ('GDELT_MAX_RESULTS', 'gdelt.max_results', 'int'),
+        ('ALPHA_VANTAGE_API_KEY', 'alpha_vantage.api_key', 'string'),
+        ('ALPHA_VANTAGE_BASE_URL', 'alpha_vantage.base_url', 'string'),
+        ('ALPHA_VANTAGE_TIMEOUT', 'alpha_vantage.timeout', 'int'),
+        ('ALPHA_VANTAGE_NEWS_LIMIT', 'alpha_vantage.news_limit', 'int'),
     ]
 
     for env_name, dotted_key, value_type in mappings:
