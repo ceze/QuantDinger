@@ -15,7 +15,7 @@ from app.data_providers.forex import fetch_forex_pairs
 logger = get_logger(__name__)
 
 # AI分析币种数量，按市值排序
-_AI_ANALYZE_CYPTO_COUNT_ = 50
+_AI_ANALYZE_CYPTO_COUNT_ = 60
 # ---------------------------------------------------------------------------
 # Price fetchers for opportunity scanning
 # ---------------------------------------------------------------------------
@@ -265,6 +265,11 @@ def analyze_opportunities_crypto(opportunities: list):
             reason = f"24h涨幅{change:.1f}%，上涨动能强劲!"
             reason_en = f"24h +{change:.1f}%, strong bullish momentum!"
             impact = "bullish"
+        elif change > 3:
+            signal, strength = "bullish_momentum", "weak"
+            reason = f"24h涨幅{change:.1f}%，温和上涨."; 
+            reason_en = f"24h +{change:.1f}%, mild uptrend."
+            impact = "bullish"
         elif change < -15:
             signal, strength = "oversold", "strong"
             reason = f"24h跌幅{abs(change):.1f}%，可能超卖反弹."
@@ -274,6 +279,11 @@ def analyze_opportunities_crypto(opportunities: list):
             signal, strength = "bearish_momentum", "medium"
             reason = f"24h跌幅{abs(change):.1f}%，下跌趋势明显."
             reason_en = f"24h -{abs(change):.1f}%, clear bearish trend."
+            impact = "bearish"
+        elif change < -3:
+            signal, strength = "bearish_momentum", "weak"
+            reason = f"24h跌幅{abs(change):.1f}%，温和下跌."; 
+            reason_en = f"24h -{abs(change):.1f}%, mild downtrend."
             impact = "bearish"
 
         if signal:
